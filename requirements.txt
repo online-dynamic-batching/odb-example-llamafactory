@@ -1,0 +1,6 @@
+online-dynamic-batching[hf]>=0.1.2
+odb-mm-mix-example @ git+https://github.com/online-dynamic-batching/odb-mm-mix-example.git
+pyyaml>=6
+datasets>=2.18
+Pillow>=10
+tqdm>=4.66

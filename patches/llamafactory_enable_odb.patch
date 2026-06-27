@@ -1,0 +1,239 @@
+diff --git a/src/llamafactory/data/lazy/config.py b/src/llamafactory/data/lazy/config.py
+index d1cec77a..63c289c1 100644
+--- a/src/llamafactory/data/lazy/config.py
++++ b/src/llamafactory/data/lazy/config.py
+@@ -83,6 +83,7 @@ class QMDBLoaderConfig:
+ 
+     # ODB (Online Dynamic Batch) mode
+     use_odb: bool = False
++    defer_odb_apply_to_trainer: bool = False
+ 
+     # ODB version: 1 = original (odb.py), 11 = v1 + shutdown fixes (odb1_1.py),
+     # 2 = bug-fixed (odb2.py), 3 = v2 + join_mode (odb3.py),
+diff --git a/src/llamafactory/data/lazy/loader.py b/src/llamafactory/data/lazy/loader.py
+index 8a8fdffb..9cb01ef6 100644
+--- a/src/llamafactory/data/lazy/loader.py
++++ b/src/llamafactory/data/lazy/loader.py
+@@ -575,12 +575,16 @@ def _create_dataloader(
+             f"ODB DataLoader requires num_workers > 0, setting to {num_workers}"
+         )
+ 
+-    # For ODB, use a simple collator since the dataset already returns tensors
+-    # The complex multimodal processing is done in the dataset's __getitem__
+-    if loader_config.use_odb:
++    # Lazy QMDB datasets already return fully processed tensor samples. Use
++    # SimpleCollator for all lazy loaders, including Standard baselines; the
++    # original multimodal collator expects list[int] token fields.
++    if tokenizer is not None:
+         from .collator import create_simple_collator
+         collator = create_simple_collator(tokenizer, compute_dtype=compute_dtype)
+ 
++    if loader_config.use_odb:
++        torch.multiprocessing.set_sharing_strategy("file_system")
++
+     # Create DataLoader
+     dataloader = DataLoader(
+         dataset,
+ 
+@@ -614,6 +615,10 @@ def _create_dataloader(
+                 prefetch_factor=prefetch_factor if num_workers > 0 else None,
+             )
+ 
++    if loader_config.use_odb and loader_config.defer_odb_apply_to_trainer:
++        return dataloader
++
++    if loader_config.use_odb:
+         from ..dataloaders import apply_odb
+ 
+         apply_odb(
+diff --git a/src/llamafactory/data/loader.py b/src/llamafactory/data/loader.py
+index 63520a2d..a61750d2 100644
+--- a/src/llamafactory/data/loader.py
++++ b/src/llamafactory/data/loader.py
+@@ -504,9 +504,11 @@ def _get_tmdb_dataset_from_attrs(
+         )
+ 
+     # Build loader config
++    defer_odb_apply_to_trainer = bool(data_args.use_odb and data_args.odb_version == 51)
+     loader_config = QMDBLoaderConfig(
+         datasets=configs,
+         use_odb=data_args.use_odb,
++        defer_odb_apply_to_trainer=defer_odb_apply_to_trainer,
+         odb_version=data_args.odb_version,
+         odb_join_mode=data_args.odb_join_mode,
+         odb_loss_scaling_mode=data_args.odb_loss_scaling_mode,
+@@ -618,6 +620,7 @@ def _get_tmdb_dataset_from_attrs(
+         "_lazy_dataloader": dataloader,
+         "_lazy_collator": collator,
+         "_use_odb": data_args.use_odb,
++        "_enable_odb_with_package": defer_odb_apply_to_trainer,
+         "_odb_max_input_length": data_args.odb_max_input_length,
+         "_odb_version": data_args.odb_version,
+         "_odb_join_mode": data_args.odb_join_mode,
+@@ -632,5 +635,3 @@ def _get_tmdb_dataset_from_attrs(
+         dataset_module["eval_dataset"] = eval_dataset
+ 
+     return dataset_module
+-
+-
+diff --git a/src/llamafactory/data/parser.py b/src/llamafactory/data/parser.py
+index 5209da64..bde80452 100644
+--- a/src/llamafactory/data/parser.py
++++ b/src/llamafactory/data/parser.py
+@@ -14,7 +14,7 @@
+ 
+ import json
+ import os
+-from dataclasses import dataclass
++from dataclasses import dataclass, field
+ from typing import Any, Literal
+ 
+ from huggingface_hub import hf_hub_download
+@@ -28,7 +28,7 @@ class DatasetAttr:
+     r"""Dataset attributes."""
+ 
+     # basic configs
+-    load_from: Literal["hf_hub", "ms_hub", "om_hub", "script", "file"]
++    load_from: Literal["hf_hub", "ms_hub", "om_hub", "script", "file", "tmdb"]
+     dataset_name: str
+     formatting: Literal["alpaca", "sharegpt", "openai"] = "alpaca"
+     ranking: bool = False
+@@ -62,6 +62,7 @@ class DatasetAttr:
+     observation_tag: str | None = "observation"
+     function_tag: str | None = "function_call"
+     system_tag: str | None = "system"
++    extra: dict[str, Any] = field(default_factory=dict)
+ 
+     def __repr__(self) -> str:
+         return self.dataset_name
+@@ -89,6 +90,25 @@ class DatasetAttr:
+             for tag in tag_names:
+                 self.set_attr(tag, attr["tags"])
+ 
++        known = {
++            "formatting",
++            "ranking",
++            "subset",
++            "split",
++            "folder",
++            "num_samples",
++            "columns",
++            "tags",
++            "hf_hub_url",
++            "ms_hub_url",
++            "om_hub_url",
++            "script_url",
++            "cloud_file_name",
++            "file_name",
++            "tmdb_file",
++        }
++        self.extra = {key: value for key, value in attr.items() if key not in known}
++
+ 
+ def get_dataset_list(dataset_names: list[str] | None, dataset_dir: str | dict) -> list["DatasetAttr"]:
+     r"""Get the attributes of the datasets."""
+@@ -140,6 +160,8 @@ def get_dataset_list(dataset_names: list[str] | None, dataset_dir: str | dict) -
+             dataset_attr = DatasetAttr("script", dataset_name=dataset_info[name]["script_url"])
+         elif "cloud_file_name" in dataset_info[name]:
+             dataset_attr = DatasetAttr("cloud_file", dataset_name=dataset_info[name]["cloud_file_name"])
++        elif "tmdb_file" in dataset_info[name]:
++            dataset_attr = DatasetAttr("tmdb", dataset_name=dataset_info[name]["tmdb_file"])
+         else:
+             dataset_attr = DatasetAttr("file", dataset_name=dataset_info[name]["file_name"])
+ 
+diff --git a/src/llamafactory/train/sft/trainer.py b/src/llamafactory/train/sft/trainer.py
+index a429e65d..20feef26 100644
+--- a/src/llamafactory/train/sft/trainer.py
++++ b/src/llamafactory/train/sft/trainer.py
+@@ -142,6 +142,7 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
+         # These are used for QMDB lazy loading with OLG/ODB dataloaders
+         self._lazy_dataloader = kwargs.pop("_lazy_dataloader", None)
+         self._lazy_collator = kwargs.pop("_lazy_collator", None)
++        self._enable_odb_with_package = kwargs.pop("_enable_odb_with_package", False)
+ 
+         # Pop ODB configuration for standard HuggingFace Dataset
+         self._use_odb = kwargs.pop("_use_odb", False)
+@@ -506,6 +507,14 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
+             f"(dataset_size={dataset_size} × epochs={self.args.num_train_epochs})"
+         )
+ 
++        active_max_steps = getattr(self.args, "max_steps", None)
++        try:
++            max_optimizer_steps = int(active_max_steps) if active_max_steps is not None else None
++        except (TypeError, ValueError):
++            max_optimizer_steps = None
++        if max_optimizer_steps is not None and max_optimizer_steps <= 0:
++            max_optimizer_steps = None
++
+         # Set max_steps to total samples count.
+         # HuggingFace Trainer uses max_steps for lr_scheduler total steps.
+         # The callback compensates lr_scheduler stepping by calling extra
+@@ -515,8 +524,13 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
+         # Disable __len__ to prevent Trainer from recalculating max_steps
+         type(dataloader).__len__ = lambda self: None
+ 
+-        # Register the callback
+-        self.add_callback(ODBDynamicBatchCallback(odb_total_samples))
++        # Register the callback. For short validation runs, preserve the
++        # original optimizer-step cap while keeping the sample-budget scheduler
++        # semantics used by full ODB training.
++        try:
++            self.add_callback(ODBDynamicBatchCallback(odb_total_samples, max_optimizer_steps=max_optimizer_steps))
++        except TypeError:
++            self.add_callback(ODBDynamicBatchCallback(odb_total_samples))
+         self._odb_epoch_callback_registered = True
+ 
+         # Replace ProgressCallback so the progress bar shows sample progress
+diff --git a/src/llamafactory/train/sft/workflow.py b/src/llamafactory/train/sft/workflow.py
+index db625028..b291df79 100644
+--- a/src/llamafactory/train/sft/workflow.py
++++ b/src/llamafactory/train/sft/workflow.py
+@@ -38,6 +38,14 @@ if TYPE_CHECKING:
+ logger = get_logger(__name__)
+ 
+ 
++def _odb_package_loss_scaling(mode: str) -> str:
++    if mode == "token_exact":
++        return "exact"
++    if mode == "token_approx":
++        return "approx"
++    return "none"
++
++
+ def run_sft(
+     model_args: "ModelArguments",
+     data_args: "DataArguments",
+@@ -134,6 +142,33 @@ def run_sft(
+             **metric_module,
+         )
+ 
++    if dataset_module.get("_enable_odb_with_package"):
++        from odb.integrations.llamafactory import enable_odb
++
++        loss_scaling = _odb_package_loss_scaling(data_args.odb_loss_scaling_mode)
++        logger.info_rank0(
++            "[ODB] Enabling standalone package via "
++            "odb.integrations.llamafactory.enable_odb("
++            f"token_budget={data_args.odb_max_input_length}, "
++            f"loss_scaling={loss_scaling}, join={data_args.odb_join_mode})"
++        )
++        enable_odb(
++            trainer,
++            train_dataloader=dataset_module["_lazy_dataloader"],
++            training_args=training_args,
++            data_args=data_args,
++            train_dataset=dataset_module["train_dataset"],
++            token_budget=data_args.odb_max_input_length,
++            loss_scaling=loss_scaling,
++            join=data_args.odb_join_mode,
++            trainer_integration="framework",
++            no_warmup=data_args.odb_no_warmup,
++            no_sync=data_args.odb_no_sync,
++            buffer_size=data_args.odb_buffer_size,
++            max_patches=data_args.odb_max_patches,
++            version=data_args.odb_version,
++        )
++
+     # Training
+     if training_args.do_train:
+         train_result = trainer.train(resume_from_checkpoint=training_args.resume_from_checkpoint)
