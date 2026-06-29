@@ -1,0 +1,4779 @@
+diff --git a/src/llamafactory/data/lazy/__init__.py b/src/llamafactory/data/lazy/__init__.py
+new file mode 100644
+index 00000000..1486a1bd
+--- /dev/null
++++ b/src/llamafactory/data/lazy/__init__.py
+@@ -0,0 +1,39 @@
++# Copyright 2025 the LlamaFactory team.
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++"""
++Lazy loading module for QMDB (TMDB/LMDB) data sources.
++
++Features:
++- Lazy loading: Only store keys, load data on-demand
++- On-the-fly tokenization
++- Compatible with Qwen3-VL and other multimodal models
++- Support for OLG (Online Length Grouped) and ODB (Online Dynamic Batch) DataLoaders
++"""
++
++from .config import QMDBDatasetConfig, parse_qmdb_config
++from .dataset import LazyQMDBDataset
++from .loader import get_lazy_qmdb_dataloader, create_lazy_collator
++from .collator import SimpleCollator, create_simple_collator
++
++
++__all__ = [
++    "QMDBDatasetConfig",
++    "parse_qmdb_config",
++    "LazyQMDBDataset",
++    "get_lazy_qmdb_dataloader",
++    "create_lazy_collator",
++    "SimpleCollator",
++    "create_simple_collator",
++]
+diff --git a/src/llamafactory/data/lazy/collator.py b/src/llamafactory/data/lazy/collator.py
+new file mode 100644
+index 00000000..29b17d83
+--- /dev/null
++++ b/src/llamafactory/data/lazy/collator.py
+@@ -0,0 +1,267 @@
++# Copyright 2025 the LlamaFactory team.
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++"""
++Simple collator for lazy QMDB datasets.
++
++This collator is designed to work with ODB/OLG DataLoaders where the dataset
++already returns fully processed tensor data.
++"""
++
++from typing import TYPE_CHECKING, Any, Dict, List, Optional
++
++import torch
++import torch.nn.functional as F
++
++try:
++    from odb.constants import TOTAL_BATCH_SIZE_KEY as ODB_TOTAL_BATCH_SIZE_KEY
++except Exception:
++    ODB_TOTAL_BATCH_SIZE_KEY = "total_batch_size"
++
++
++if TYPE_CHECKING:
++    from transformers import PreTrainedTokenizer
++
++
++class SimpleCollator:
++    """
++    Simple collator that pads and batches tensor data.
++
++    This collator expects the dataset to return data with:
++    - input_ids: tensor of shape (1, seq_len)
++    - attention_mask: tensor of shape (1, seq_len)
++    - labels: tensor of shape (1, seq_len)
++    - Optional multimodal inputs (pixel_values, etc.)
++
++    This is designed for use with ODB/OLG DataLoaders where complex
++    multimodal processing is already done in the dataset.
++    """
++
++    def __init__(
++        self,
++        tokenizer: "PreTrainedTokenizer",
++        pad_to_multiple_of: int = 8,
++        compute_dtype: Optional["torch.dtype"] = None,
++    ):
++        self.tokenizer = tokenizer
++        self.pad_to_multiple_of = pad_to_multiple_of
++        self.padding_side = tokenizer.padding_side
++        self.pad_token_id = tokenizer.pad_token_id or 0
++        self.label_pad_token_id = -100
++        self.compute_dtype = compute_dtype
++
++    def __call__(self, features: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
++        """
++        Collate a batch of features.
++
++        Args:
++            features: List of feature dicts from the dataset
++
++        Returns:
++            Batched and padded tensors
++        """
++        if not features:
++            return {}
++
++        # Debug: Log batch composition
++        import os
++        if os.environ.get("DEBUG_LAZY_DATASET"):
++            n_with_pv = sum(1 for f in features if f.get("pixel_values") is not None)
++            n_total = len(features)
++            print(f"[SimpleCollator] batch_size={n_total}, samples_with_pixel_values={n_with_pv}")
++
++        # Filter out invalid features (empty input_ids)
++        valid_features = []
++        for f in features:
++            input_ids = f.get("input_ids")
++            if input_ids is None:
++                continue
++            if isinstance(input_ids, torch.Tensor):
++                # Squeeze to get actual sequence length
++                if input_ids.dim() > 1:
++                    seq_len = input_ids.size(-1)  # last dim is seq_len
++                else:
++                    seq_len = input_ids.size(0)
++                if seq_len == 0 or input_ids.numel() == 0:
++                    continue
++            elif isinstance(input_ids, (list, tuple)):
++                if len(input_ids) == 0:
++                    continue
++            valid_features.append(f)
++
++        # If all features were invalid, return empty dict
++        # This should be handled by the training loop
++        if not valid_features:
++            import warnings
++            warnings.warn(
++                "SimpleCollator received batch with all empty input_ids, returning empty dict"
++            )
++            return {}
++
++        features = valid_features
++
++        # Extract total_batch_size if present (for ODB)
++        total_batch_size = None
++        for feature in features:
++            if ODB_TOTAL_BATCH_SIZE_KEY in feature and feature[ODB_TOTAL_BATCH_SIZE_KEY] is not None:
++                total_batch_size = feature.pop(ODB_TOTAL_BATCH_SIZE_KEY)
++            elif ODB_TOTAL_BATCH_SIZE_KEY in feature:
++                feature.pop(ODB_TOTAL_BATCH_SIZE_KEY)
++
++        # Get the keys from the first feature
++        batch = {}
++
++        # Handle input_ids, attention_mask, labels
++        for key in ["input_ids", "attention_mask", "labels"]:
++            if key not in features[0]:
++                continue
++
++            tensors = [f[key] for f in features]
++
++            # Squeeze if needed (remove batch dim from individual samples)
++            tensors = [t.squeeze(0) if t.dim() > 1 else t for t in tensors]
++
++            # Find max length
++            max_len = max(t.size(0) for t in tensors)
++
++            # Pad to multiple
++            if self.pad_to_multiple_of:
++                max_len = ((max_len + self.pad_to_multiple_of - 1) //
++                          self.pad_to_multiple_of) * self.pad_to_multiple_of
++
++            # Determine padding value
++            if key == "labels":
++                pad_value = self.label_pad_token_id
++            elif key == "attention_mask":
++                pad_value = 0
++            else:
++                pad_value = self.pad_token_id
++
++            # Pad tensors
++            padded = []
++            for t in tensors:
++                pad_len = max_len - t.size(0)
++                if pad_len > 0:
++                    if self.padding_side == "right":
++                        t = F.pad(t, (0, pad_len), value=pad_value)
++                    else:
++                        t = F.pad(t, (pad_len, 0), value=pad_value)
++                padded.append(t)
++
++            batch[key] = torch.stack(padded)
++
++        # Handle other keys (multimodal inputs like pixel_values, grid_sizes, etc.)
++        first_feature = features[0]
++        for key in first_feature:
++            if key in ["input_ids", "attention_mask", "labels"]:
++                continue
++
++            values = [f.get(key) for f in features if key in f]
++            if not values:
++                continue
++
++            # Filter out None values
++            values = [v for v in values if v is not None]
++            if not values:
++                continue
++
++            # If all values are tensors, try to stack/cat them
++            if all(isinstance(v, torch.Tensor) for v in values):
++                # Check for empty tensors
++                non_empty = [v for v in values if v.numel() > 0]
++                if not non_empty:
++                    continue
++                try:
++                    # Try to concatenate along batch dimension
++                    batch[key] = torch.cat(non_empty, dim=0)
++                except RuntimeError:
++                    # If shapes don't match, keep as list
++                    batch[key] = non_empty
++            elif all(isinstance(v, list) for v in values):
++                # Flatten lists, filter out empty
++                flat = sum(values, [])
++                if flat:
++                    batch[key] = flat
++            else:
++                # Keep as list, filter out None
++                batch[key] = [v for v in values if v is not None]
++
++        # Add total_batch_size for ODB gradient scaling
++        if total_batch_size is not None:
++            batch[ODB_TOTAL_BATCH_SIZE_KEY] = total_batch_size
++
++        # Ensure multimodal keys are always present for Qwen3VL compatibility
++        # Even if all samples are text-only, we should explicitly set these to None
++        # to maintain consistent batch structure across DDP ranks
++        multimodal_keys = ["pixel_values", "image_grid_thw", "pixel_values_videos", "video_grid_thw"]
++        for mm_key in multimodal_keys:
++            if mm_key not in batch:
++                batch[mm_key] = None
++
++        # Final validation: ensure input_ids has non-zero sequence length
++        if "input_ids" in batch:
++            input_ids = batch["input_ids"]
++            if isinstance(input_ids, torch.Tensor):
++                # Check if sequence length is 0
++                if input_ids.dim() >= 2 and input_ids.size(-1) == 0:
++                    import warnings
++                    warnings.warn(
++                        f"SimpleCollator produced batch with zero sequence length: {input_ids.shape}, "
++                        "returning empty dict"
++                    )
++                    return {}
++                if input_ids.numel() == 0:
++                    import warnings
++                    warnings.warn(
++                        f"SimpleCollator produced empty input_ids tensor: {input_ids.shape}, "
++                        "returning empty dict"
++                    )
++                    return {}
++
++        # Convert floating point tensors to compute_dtype for consistency with SFTDataCollatorWith4DAttentionMask
++        # This ensures pixel_values and other float tensors use the same dtype as the JSON data path
++        if self.compute_dtype is not None:
++            for key, value in batch.items():
++                if torch.is_tensor(value) and torch.is_floating_point(value):
++                    batch[key] = value.to(self.compute_dtype)
++
++        return batch
++
++
++def create_simple_collator(
++    tokenizer: "PreTrainedTokenizer",
++    pad_to_multiple_of: int = 8,
++    compute_dtype: Optional["torch.dtype"] = None,
++) -> SimpleCollator:
++    """
++    Create a simple collator for lazy QMDB datasets.
++
++    This collator is designed for use with ODB/OLG DataLoaders where
++    the dataset already returns fully processed tensor data.
++
++    Args:
++        tokenizer: Tokenizer for padding configuration
++        pad_to_multiple_of: Pad sequences to multiple of this value
++        compute_dtype: Target dtype for floating point tensors (e.g., torch.bfloat16).
++                       If provided, all float tensors will be converted to this dtype.
++                       This ensures consistency with SFTDataCollatorWith4DAttentionMask.
++
++    Returns:
++        Configured SimpleCollator
++    """
++    return SimpleCollator(
++        tokenizer=tokenizer,
++        pad_to_multiple_of=pad_to_multiple_of,
++        compute_dtype=compute_dtype,
++    )
+diff --git a/src/llamafactory/data/lazy/config.py b/src/llamafactory/data/lazy/config.py
+new file mode 100644
+index 00000000..63c289c1
+--- /dev/null
++++ b/src/llamafactory/data/lazy/config.py
+@@ -0,0 +1,328 @@
++# Copyright 2025 the LlamaFactory team.
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++"""
++Configuration classes and parsing utilities for QMDB datasets.
++"""
++
++import os
++from dataclasses import dataclass, field
++from typing import Any, Dict, List, Literal, Optional
++
++import yaml
++
++
++@dataclass
++class QMDBDatasetConfig:
++    """Configuration for a single QMDB dataset."""
++
++    # Required fields
++    name: str
++    data_file: str  # Path to tmdb/lmdb directory or file
++
++    # Optional paths
++    image_dir: Optional[str] = None
++    extra_path: Optional[str] = None  # Extra lmdb for images
++
++    # Data format
++    formatting: Literal["alpaca", "sharegpt"] = "sharegpt"
++
++    # Sampling
++    max_samples: Optional[int] = None  # Maximum number of samples to use (None = all)
++    weight: float = 1.0  # Weight for mixing datasets
++
++    # Fixed prompt (for some tasks like OCR)
++    prompt: Optional[str] = None
++
++    # Column/field mapping
++    messages_key: str = "conversations"
++    images_key: str = "images"
++    videos_key: str = "video"
++
++    # Alpaca format keys
++    instruction_key: str = "instruction"
++    input_key: str = "input"
++    output_key: str = "output"
++
++    # ShareGPT format tags
++    role_tag: str = "from"
++    content_tag: str = "value"
++    user_tag: str = "human"
++    assistant_tag: str = "gpt"
++    system_tag: str = "system"
++
++    def __post_init__(self):
++        """Validate configuration after initialization."""
++        if not self.data_file:
++            raise ValueError(f"data_file is required for dataset '{self.name}'")
++
++        if self.weight <= 0:
++            raise ValueError(f"weight must be positive for dataset '{self.name}'")
++
++        if self.max_samples is not None and self.max_samples <= 0:
++            raise ValueError(f"max_samples must be positive for dataset '{self.name}'")
++
++
++@dataclass
++class QMDBLoaderConfig:
++    """Configuration for QMDB data loading."""
++
++    # Dataset configurations
++    datasets: List[QMDBDatasetConfig] = field(default_factory=list)
++
++    # ODB (Online Dynamic Batch) mode
++    use_odb: bool = False
++    defer_odb_apply_to_trainer: bool = False
++
++    # ODB version: 1 = original (odb.py), 11 = v1 + shutdown fixes (odb1_1.py),
++    # 2 = bug-fixed (odb2.py), 3 = v2 + join_mode (odb3.py),
++    # 4 = v3 + max-based cross-rank group alignment (odb4.py)
++    odb_version: int = 1
++
++    # ODB join mode: when True + odb_version=3, finished rank StopIteration independently
++    odb_join_mode: bool = False
++
++    # ODB DDP loss-scaling strategy. See DataArguments.odb_loss_scaling_mode.
++    # One of: "sample", "token_approx", "token_exact".
++    odb_loss_scaling_mode: str = "sample"
++
++    # ODB ablation flags
++    odb_no_warmup: bool = False
++    odb_no_sync: bool = False
++    odb_buffer_size: int | None = None
++    odb_max_patches: int = 0
++
++    # ODB specific
++    max_input_length: int = 8192
++
++    # ODB buffer settings
++    buffer_factor: float = 0.9
++
++    # Sorted Batching
++    use_sorted_batching: bool = False
++    use_hf_group_by_length: bool = False
++
++    # Token-budget batch sampling (GMT/BMT) - mutually exclusive with use_odb and length-grouped baselines
++    use_global_max_tokens: bool = False
++    use_bucketed_max_tokens: bool = False
++    max_tokens_budget: int = 8192
++    max_tokens_bucket_size: int = 4096
++    max_tokens_oracle_cache: str | None = None
++
++    # Data processing
++    cutoff_len: int = 2048
++    preprocessing_num_workers: int = 4
++
++    def __post_init__(self):
++        """Validate configuration after initialization."""
++        if not self.datasets:
++            raise ValueError("At least one dataset is required")
++
++        if self.max_input_length <= 0:
++            raise ValueError("max_input_length must be positive")
++
++        if not 0 < self.buffer_factor <= 1:
++            raise ValueError("buffer_factor must be in (0, 1]")
++
++        enabled_batch_modes = sum(
++            bool(x)
++            for x in (
++                self.use_odb,
++                self.use_sorted_batching,
++                self.use_hf_group_by_length,
++                self.use_global_max_tokens,
++                self.use_bucketed_max_tokens,
++            )
++        )
++        if enabled_batch_modes > 1:
++            raise ValueError(
++                "Batching modes are mutually exclusive: use_odb, use_sorted_batching, "
++                "use_hf_group_by_length, use_global_max_tokens, use_bucketed_max_tokens."
++            )
++
++
++def parse_qmdb_config(config_path: str) -> QMDBLoaderConfig:
++    """
++    Parse QMDB configuration from a YAML file.
++
++    Args:
++        config_path: Path to the YAML configuration file
++
++    Returns:
++        QMDBLoaderConfig object with all dataset configurations
++
++    Example YAML format:
++    ```yaml
++    dataloader_type: odb
++    max_input_length: 8192
++    cutoff_len: 2048
++
++    datasets:
++      - name: ShareCaptioner
++        data_file: /path/to/tmdb
++        image_dir: /path/to/images
++        formatting: sharegpt
++        weight: 1.0
++
++      - name: synthdog-en
++        data_file: /path/to/tmdb
++        formatting: sharegpt
++        prompt: "Recognize text in the image"
++        max_samples: 100000
++    ```
++    """
++    if not os.path.exists(config_path):
++        raise FileNotFoundError(f"Config file not found: {config_path}")
++
++    with open(config_path, "r", encoding="utf-8") as f:
++        raw_config = yaml.safe_load(f)
++
++    if raw_config is None:
++        raise ValueError(f"Empty config file: {config_path}")
++
++    # Parse datasets
++    datasets = []
++    raw_datasets = raw_config.pop("datasets", [])
++
++    for ds_config in raw_datasets:
++        if isinstance(ds_config, dict):
++            datasets.append(QMDBDatasetConfig(**ds_config))
++        else:
++            raise ValueError(f"Invalid dataset config: {ds_config}")
++
++    # Parse loader config
++    loader_config = QMDBLoaderConfig(
++        datasets=datasets,
++        use_odb=raw_config.pop("use_odb", False),
++        odb_version=raw_config.pop("odb_version", 1),
++        max_input_length=raw_config.pop("max_input_length", raw_config.pop("odb_max_input_length", 8192)),
++        buffer_factor=raw_config.pop("buffer_factor", 0.9),
++        use_sorted_batching=raw_config.pop("use_sorted_batching", False),
++        use_hf_group_by_length=raw_config.pop("use_hf_group_by_length", False),
++        use_global_max_tokens=raw_config.pop("use_global_max_tokens", False),
++        use_bucketed_max_tokens=raw_config.pop("use_bucketed_max_tokens", False),
++        max_tokens_budget=raw_config.pop("max_tokens_budget", 8192),
++        max_tokens_bucket_size=raw_config.pop("max_tokens_bucket_size", 4096),
++        max_tokens_oracle_cache=raw_config.pop("max_tokens_oracle_cache", None),
++        cutoff_len=raw_config.pop("cutoff_len", 2048),
++        preprocessing_num_workers=raw_config.pop("preprocessing_num_workers", 4),
++    )
++
++    # Warn about unknown keys
++    if raw_config:
++        import warnings
++        warnings.warn(f"Unknown config keys: {list(raw_config.keys())}")
++
++    return loader_config
++
++
++def parse_qmdb_yaml_datasets(yaml_path: str) -> List[QMDBDatasetConfig]:
++    """
++    Parse datasets from the qqmm-style YAML format (train_s0_datasets.yaml).
++
++    This format uses nested categories:
++    ```yaml
++    Caption:
++      ShareCaptioner:
++        data_file: /path/to/tmdb
++        image_dir: /path/to/images
++
++    OCR:
++      synthdog-en:
++        data_file: /path/to/tmdb
++        prompt: 'Recognize text'
++    ```
++
++    Args:
++        yaml_path: Path to the YAML file
++
++    Returns:
++        List of QMDBDatasetConfig objects
++    """
++    if not os.path.exists(yaml_path):
++        raise FileNotFoundError(f"YAML file not found: {yaml_path}")
++
++    with open(yaml_path, "r", encoding="utf-8") as f:
++        raw_config = yaml.safe_load(f)
++
++    if raw_config is None:
++        return []
++
++    datasets = []
++
++    for category, category_datasets in raw_config.items():
++        if not isinstance(category_datasets, dict):
++            continue
++
++        for name, ds_config in category_datasets.items():
++            if ds_config is None:
++                continue
++            if not isinstance(ds_config, dict):
++                continue
++
++            # Build full name with category prefix if needed
++            full_name = f"{category}/{name}" if "/" not in name else name
++
++            # Map yaml keys to config keys
++            config_dict = {
++                "name": full_name,
++                "data_file": ds_config.get("data_file"),
++                "image_dir": ds_config.get("image_dir"),
++                "extra_path": ds_config.get("extra_path"),
++                "prompt": ds_config.get("prompt"),
++                "max_samples": ds_config.get("max_samples"),
++                "weight": ds_config.get("weight", 1.0),
++                "formatting": ds_config.get("formatting", "sharegpt"),
++            }
++
++            # Remove None values
++            config_dict = {k: v for k, v in config_dict.items() if v is not None}
++
++            try:
++                datasets.append(QMDBDatasetConfig(**config_dict))
++            except (TypeError, ValueError) as e:
++                import warnings
++                warnings.warn(f"Skipping invalid dataset '{full_name}': {e}")
++                continue
++
++    return datasets
++
++
++def create_default_config(
++    data_file: str,
++    name: Optional[str] = None,
++    image_dir: Optional[str] = None,
++    **kwargs
++) -> QMDBDatasetConfig:
++    """
++    Create a QMDBDatasetConfig with sensible defaults.
++
++    Args:
++        data_file: Path to the QMDB data file
++        name: Dataset name (defaults to basename of data_file)
++        image_dir: Path to image directory
++        **kwargs: Additional configuration options
++
++    Returns:
++        QMDBDatasetConfig object
++    """
++    if name is None:
++        name = os.path.basename(data_file.rstrip("/"))
++
++    return QMDBDatasetConfig(
++        name=name,
++        data_file=data_file,
++        image_dir=image_dir,
++        **kwargs
++    )
+diff --git a/src/llamafactory/data/lazy/dataset.py b/src/llamafactory/data/lazy/dataset.py
+new file mode 100644
+index 00000000..8142f016
+--- /dev/null
++++ b/src/llamafactory/data/lazy/dataset.py
+@@ -0,0 +1,653 @@
++# Copyright 2025 the LlamaFactory team.
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++"""
++Lazy loading QMDB dataset implementation.
++
++Features:
++- Only stores keys in memory, loads data on-demand
++- On-the-fly tokenization and processing
++- Compatible with Qwen3-VL and other multimodal models
++- Seamless integration with LlamaFactory's MultiModalDataCollatorForSeq2Seq
++"""
++
++import os
++import random
++import sys
++from copy import deepcopy
++from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
++
++import torch
++from torch.utils.data import Dataset
++
++from ...extras.constants import IGNORE_INDEX
++from .config import QMDBDatasetConfig
++
++
++if TYPE_CHECKING:
++    from PIL.Image import Image as ImageObject
++    from transformers import PreTrainedTokenizer, ProcessorMixin
++
++    from ..template import Template
++
++
++class LazyQMDBDataset(Dataset):
++    """
++    Lazy loading dataset for QMDB (TMDB/LMDB) data sources.
++
++    This dataset:
++    - Only stores keys in memory, not the actual data
++    - Loads and processes data on-demand in __getitem__
++    - Returns data compatible with LlamaFactory's MultiModalDataCollatorForSeq2Seq
++    - Supports both image and video modalities
++
++    The returned dict contains:
++    - input_ids: List[int] - tokenized input
++    - attention_mask: List[int] - attention mask (all 1s)
++    - labels: List[int] - labels with IGNORE_INDEX for prompts
++    - images: List[PIL.Image] - raw PIL images for Collator to process
++    - videos: List[...] - raw video data
++    - audios: List[...] - raw audio data (usually empty)
++    """
++
++    def __init__(
++        self,
++        config: QMDBDatasetConfig,
++        template: "Template",
++        tokenizer: "PreTrainedTokenizer",
++        processor: Optional["ProcessorMixin"] = None,
++        cutoff_len: int = 2048,
++        train_on_prompt: bool = False,
++        mask_history: bool = False,
++    ):
++        """
++        Initialize the lazy dataset.
++
++        Args:
++            config: Dataset configuration
++            template: LlamaFactory template (contains mm_plugin)
++            tokenizer: Tokenizer for text encoding
++            processor: Multimodal processor (for Qwen3-VL, etc.)
++            cutoff_len: Maximum sequence length
++            train_on_prompt: Whether to compute loss on prompts
++            mask_history: Whether to mask history turns
++        """
++        self.config = config
++        self.template = template
++        self.tokenizer = tokenizer
++        self.processor = processor
++        self.cutoff_len = cutoff_len
++        self.train_on_prompt = train_on_prompt
++        self.mask_history = mask_history
++
++        # Get mm_plugin from template
++        self.mm_plugin = template.mm_plugin
++
++        # Lazy load: only get keys, don't load data
++        self._init_reader()
++
++    def _init_reader(self):
++        """Initialize the QMDB reader and get keys.
++
++        Important: We only use the reader to get keys, then set it to None.
++        This is critical for multiprocessing/fork safety - LMDB readers
++        cannot be shared across forked processes.
++        """
++        from ..qmdb.reader import load
++
++        # Temporarily create reader just to get keys
++        temp_reader = load(
++            path=self.config.data_file,
++            image_dir=self.config.image_dir,
++            extra_path=self.config.extra_path,
++        )
++
++        # Get all keys
++        self.keys = list(temp_reader.keys)
++
++        # Apply sampling if specified
++        # Use sequential truncation instead of random sampling for reproducibility
++        if self.config.max_samples is not None and self.config.max_samples < len(self.keys):
++            self.keys = self.keys[:self.config.max_samples]
++
++        # Don't store the reader - it will be created lazily in _ensure_reader
++        # This is critical for multiprocessing safety
++        self.reader = None
++        self._reader_pid = None
++
++    def _ensure_reader(self):
++        """Ensure reader is valid in current process.
++
++        LMDB readers cannot be shared across forked processes, so we must
++        create a new reader in each worker process.
++        """
++        current_pid = os.getpid()
++        if self.reader is None or self._reader_pid != current_pid:
++            # Create reader in this process
++            from ..qmdb.reader import load
++            self.reader = load(
++                path=self.config.data_file,
++                image_dir=self.config.image_dir,
++                extra_path=self.config.extra_path,
++            )
++            self._reader_pid = current_pid
++
++    def __len__(self) -> int:
++        return len(self.keys)
++
++    def __getitem__(self, index: int) -> Dict[str, Any]:
++        """
++        Load and process a single sample.
++
++        Args:
++            index: Sample index
++
++        Returns:
++            Dict containing input_ids (tensor), attention_mask (tensor), labels (tensor),
++            and multimodal inputs (pixel_values, etc.)
++        """
++        _profiling = os.environ.get("PROFILE_DATALOADER")
++
++        # Ensure reader is valid (handles fork in multiprocessing)
++        self._ensure_reader()
++
++        key = self.keys[index]
++
++        if _profiling:
++            import time
++            _t0 = time.monotonic()
++
++        # Load raw data from QMDB
++        raw = self.reader.get(key)
++        if raw is None:
++            # Return empty sample if data not found
++            return self._empty_sample()
++
++        if _profiling:
++            _t_read = time.monotonic()
++
++        try:
++            # Extract multimodal data (images remain as PIL.Image)
++            images = self._extract_images(raw)
++            videos = self._extract_videos(raw)
++            audios: List = []
++
++            if _profiling:
++                _t_extract = time.monotonic()
++
++            # Build messages in sharegpt/alpaca format
++            prompt_messages, response_messages = self._build_messages(raw)
++
++            # Ensure <image> placeholders match the number of images
++            all_messages = prompt_messages + response_messages
++            all_messages = self._ensure_image_placeholders(all_messages, len(images))
++            prompt_messages = [m for m in all_messages if m["role"] != "assistant"]
++            response_messages = [m for m in all_messages if m["role"] == "assistant"]
++
++            # Process and tokenize
++            input_ids, labels = self._encode_example(
++                prompt=prompt_messages,
++                response=response_messages,
++                images=images,
++                videos=videos,
++                audios=audios,
++            )
++
++            if _profiling:
++                _t_tokenize = time.monotonic()
++
++            # Convert to tensors for ODB compatibility
++            # ODB requires input_ids to be a tensor with .size() method
++            input_ids_tensor = torch.tensor([input_ids], dtype=torch.long)
++            attention_mask_tensor = torch.ones_like(input_ids_tensor)
++            labels_tensor = torch.tensor([labels], dtype=torch.long)
++
++            result = {
++                "input_ids": input_ids_tensor,
++                "attention_mask": attention_mask_tensor,
++                "labels": labels_tensor,
++            }
++
++            # Process multimodal inputs using mm_plugin
++            # This is what the collator would normally do, but we do it here for ODB compatibility
++            if self.processor is not None and (images or videos):
++                mm_inputs = self.mm_plugin.get_mm_inputs(
++                    images=images,
++                    videos=videos,
++                    audios=audios,
++                    imglens=[len(images)],
++                    vidlens=[len(videos)],
++                    audlens=[0],
++                    batch_ids=[input_ids],  # Note: parameter name is batch_ids, not batch_input_ids
++                    processor=self.processor,
++                )
++                result.update(mm_inputs)
++                # Record total ViT patches for ODB vision-aware grouping
++                image_grid_thw = mm_inputs.get("image_grid_thw")
++                video_grid_thw = mm_inputs.get("video_grid_thw")
++                n_patches = 0
++                if image_grid_thw is not None:
++                    n_patches += int(image_grid_thw.prod(dim=1).sum().item())
++                if video_grid_thw is not None:
++                    n_patches += int(video_grid_thw.prod(dim=1).sum().item())
++                if n_patches > 0:
++                    result["odb_n_patches"] = n_patches
++
++                stat_dir = os.environ.get("ODB_STAT_PATCHES")
++                if stat_dir and n_patches > 0:
++                    wid = torch.utils.data.get_worker_info()
++                    wname = f"w{wid.id}" if wid else "main"
++                    stat_file = os.path.join(stat_dir, f"patches_{wname}.txt")
++                    with open(stat_file, "a") as sf:
++                        sf.write(f"{n_patches}\n")
++
++            if _profiling:
++                _t_mm = time.monotonic()
++                _getitem_prof = getattr(self, "_getitem_prof", None)
++                if _getitem_prof is None:
++                    _getitem_prof = {"tmdb_read": 0.0, "img_extract": 0.0, "tokenize": 0.0, "mm_process": 0.0, "count": 0}
++                    self._getitem_prof = _getitem_prof
++                _getitem_prof["tmdb_read"] += _t_read - _t0
++                _getitem_prof["img_extract"] += _t_extract - _t_read
++                _getitem_prof["tokenize"] += _t_tokenize - _t_extract
++                _getitem_prof["mm_process"] += _t_mm - _t_tokenize
++                _getitem_prof["count"] += 1
++                n = _getitem_prof["count"]
++                if n % 200 == 0:
++                    wid = torch.utils.data.get_worker_info()
++                    wname = f"w{wid.id}" if wid else "main"
++                    print(
++                        f"[GETITEM-PROF {wname}] n={n} "
++                        f"tmdb_read={_getitem_prof['tmdb_read']:.2f}s "
++                        f"img_extract={_getitem_prof['img_extract']:.2f}s "
++                        f"tokenize={_getitem_prof['tokenize']:.2f}s "
++                        f"mm_process={_getitem_prof['mm_process']:.2f}s "
++                        f"total={sum(v for k, v in _getitem_prof.items() if k != 'count'):.2f}s "
++                        f"avg={sum(v for k, v in _getitem_prof.items() if k != 'count') / n * 1000:.1f}ms/sample",
++                        flush=True,
++                    )
++
++            return result
++
++        except Exception as e:
++            # Log error and return empty sample
++            import warnings
++            import traceback
++            tb = traceback.format_exc()
++            warnings.warn(f"Error processing sample {key}: {e}\n{tb}")
++            # Print to stderr as well for visibility in logs
++            print(f"[LazyQMDBDataset] Error processing {key}: {e}", file=sys.stderr, flush=True)
++            return self._empty_sample()
++
++    def _empty_sample(self) -> Dict[str, Any]:
++        """Return an empty sample for error cases."""
++        bos_id = self.tokenizer.bos_token_id or 0
++        return {
++            "input_ids": torch.tensor([[bos_id]], dtype=torch.long),
++            "attention_mask": torch.tensor([[1]], dtype=torch.long),
++            "labels": torch.tensor([[IGNORE_INDEX]], dtype=torch.long),
++        }
++
++    def _extract_images(self, raw: Dict) -> List["ImageObject"]:
++        """
++        Extract images from raw data, keeping them as PIL.Image.
++
++        The QMDB reader's process() method already converts images to PIL.Image.
++        """
++        # Check multiple possible keys
++        images = raw.get(self.config.images_key) or raw.get("images") or raw.get("image")
++
++        if images is None:
++            return []
++
++        if not isinstance(images, list):
++            images = [images]
++
++        result = []
++        for img in images:
++            if isinstance(img, dict):
++                # QMDB reader returns {"image": PIL.Image, "path": ...}
++                if "image" in img:
++                    result.append(img["image"])
++            else:
++                # Direct PIL.Image
++                result.append(img)
++
++        return result
++
++    def _extract_videos(self, raw: Dict) -> List:
++        """Extract videos from raw data."""
++        video = raw.get(self.config.videos_key) or raw.get("video")
++
++        if video is None:
++            return []
++
++        if isinstance(video, dict):
++            # QMDB reader returns {"video": VideoReader, "path": ...} or {"images": [...], "path": ...}
++            if "images" in video:
++                # Video as image frames
++                return [video["images"]]
++            elif "video" in video:
++                return [video["video"]]
++            elif "gif" in video:
++                return [video["gif"]]
++
++        return [video] if video else []
++
++    def _build_messages(self, raw: Dict) -> tuple[List[Dict[str, str]], List[Dict[str, str]]]:
++        """
++        Build prompt and response messages from raw data.
++
++        Returns:
++            Tuple of (prompt_messages, response_messages)
++        """
++        if self.config.formatting == "sharegpt":
++            return self._build_sharegpt_messages(raw)
++        else:
++            return self._build_alpaca_messages(raw)
++
++    def _ensure_image_placeholders(
++        self, messages: List[Dict[str, str]], num_images: int
++    ) -> List[Dict[str, str]]:
++        """Ensure messages contain the correct number of <image> placeholders.
++
++        The mm_plugin.process_messages() requires one <image> per image.
++        TMDB data may not always include them in conversation text.
++        """
++        from ...extras.constants import IMAGE_PLACEHOLDER
++
++        existing_count = sum(m["content"].count(IMAGE_PLACEHOLDER) for m in messages)
++        missing = num_images - existing_count
++        if missing <= 0:
++            return messages
++
++        for m in messages:
++            if m["role"] == "user":
++                m["content"] = (IMAGE_PLACEHOLDER + "\n") * missing + m["content"]
++                break
++
++        return messages
++
++    def _build_sharegpt_messages(self, raw: Dict) -> tuple[List[Dict[str, str]], List[Dict[str, str]]]:
++        """Build messages from ShareGPT format."""
++        convs = raw.get(self.config.messages_key, [])
++
++        if not convs:
++            # Fallback: try common field names for prompt/response
++            query = raw.get("query", "") or raw.get("question", "") or raw.get("prompt", "")
++            response = (
++                raw.get("response", "") or raw.get("answer", "")
++                or raw.get("text", "") or raw.get("caption", "")
++                or raw.get("output", "")
++            )
++            if not query and self.config.prompt:
++                query = self.config.prompt
++            if query and response:
++                return (
++                    [{"role": "user", "content": str(query)}],
++                    [{"role": "assistant", "content": str(response)}]
++                )
++            return [], []
++
++        messages = []
++        for turn in convs:
++            role = turn.get(self.config.role_tag, turn.get("role", ""))
++            content = turn.get(self.config.content_tag, turn.get("content", ""))
++
++            if role in (self.config.user_tag, "user", "human"):
++                messages.append({"role": "user", "content": str(content)})
++            elif role in (self.config.assistant_tag, "assistant", "gpt", "bot"):
++                messages.append({"role": "assistant", "content": str(content)})
++            elif role in (self.config.system_tag, "system"):
++                # Insert system message at the beginning
++                messages.insert(0, {"role": "system", "content": str(content)})
++
++        # Split into prompt (all but last) and response (last assistant message)
++        if not messages:
++            return [], []
++
++        # Find the last assistant message
++        last_assistant_idx = -1
++        for i in range(len(messages) - 1, -1, -1):
++            if messages[i]["role"] == "assistant":
++                last_assistant_idx = i
++                break
++
++        if last_assistant_idx == -1:
++            # No assistant message, treat all as prompt
++            return messages, []
++
++        prompt = messages[:last_assistant_idx]
++        response = [messages[last_assistant_idx]]
++
++        return prompt, response
++
++    def _build_alpaca_messages(self, raw: Dict) -> tuple[List[Dict[str, str]], List[Dict[str, str]]]:
++        """Build messages from Alpaca format."""
++        instruction = raw.get(self.config.instruction_key, "")
++        input_text = raw.get(self.config.input_key, "")
++        output = raw.get(self.config.output_key, "")
++
++        # Use fixed prompt if specified
++        if self.config.prompt:
++            instruction = self.config.prompt
++
++        # Combine instruction and input
++        if input_text:
++            user_content = f"{instruction}\n{input_text}".strip()
++        else:
++            user_content = str(instruction)
++
++        prompt = [{"role": "user", "content": user_content}]
++        response = [{"role": "assistant", "content": str(output)}]
++
++        return prompt, response
++
++    def _encode_example(
++        self,
++        prompt: List[Dict[str, str]],
++        response: List[Dict[str, str]],
++        images: List["ImageObject"],
++        videos: List,
++        audios: List,
++    ) -> tuple[List[int], List[int]]:
++        """
++        Encode a single example using mm_plugin and template.
++
++        This follows the same logic as SupervisedDatasetProcessor._encode_data_example
++        but adapted for single-sample processing.
++        """
++        if not prompt or not response:
++            return [self.tokenizer.bos_token_id or 0], [IGNORE_INDEX]
++
++        # Combine prompt and response for message processing
++        messages = prompt + response
++
++        # Use mm_plugin to process messages (inserts vision tokens like <|vision_start|>...)
++        messages = self.mm_plugin.process_messages(
++            messages, images, videos, audios, self.processor
++        )
++
++        # Get initial token ids from mm_plugin (for vision tokens)
++        input_ids, labels = self.mm_plugin.process_token_ids(
++            [], [], images, videos, audios, self.tokenizer, self.processor
++        )
++
++        # Encode using template
++        encoded_pairs = self.template.encode_multiturn(
++            self.tokenizer, messages, system=None, tools=None
++        )
++
++        # Process encoded pairs
++        total_length = len(input_ids) + (1 if self.template.efficient_eos else 0)
++
++        if self.mask_history:
++            encoded_pairs = encoded_pairs[::-1]
++
++        for turn_idx, (source_ids, target_ids) in enumerate(encoded_pairs):
++            if total_length >= self.cutoff_len:
++                break
++
++            source_len, target_len = self._infer_seqlen(
++                len(source_ids), len(target_ids), self.cutoff_len - total_length
++            )
++            source_ids = source_ids[:source_len]
++            target_ids = target_ids[:target_len]
++            total_length += source_len + target_len
++
++            # Build labels
++            if self.train_on_prompt:
++                source_label = source_ids
++            elif self.template.efficient_eos and turn_idx != 0:
++                source_label = [self.tokenizer.eos_token_id] + [IGNORE_INDEX] * (source_len - 1)
++            else:
++                source_label = [IGNORE_INDEX] * source_len
++
++            if self.mask_history and turn_idx != 0:
++                target_label = [IGNORE_INDEX] * target_len
++            else:
++                target_label = target_ids
++
++            # Append to input_ids and labels
++            if self.mask_history:
++                input_ids = source_ids + target_ids + input_ids
++                labels = source_label + target_label + labels
++            else:
++                input_ids = input_ids + source_ids + target_ids
++                labels = labels + source_label + target_label
++
++        # Add EOS if efficient_eos
++        if self.template.efficient_eos:
++            input_ids = input_ids + [self.tokenizer.eos_token_id]
++            labels = labels + [self.tokenizer.eos_token_id]
++
++        return input_ids, labels
++
++    @staticmethod
++    def _infer_seqlen(source_len: int, target_len: int, max_len: int) -> tuple[int, int]:
++        """Infer sequence lengths for source and target."""
++        if source_len + target_len <= max_len:
++            return source_len, target_len
++
++        if source_len < max_len // 2:
++            return source_len, max_len - source_len
++
++        if target_len < max_len // 2:
++            return max_len - target_len, target_len
++
++        return max_len // 2, max_len - max_len // 2
++
++
++class ConcatLazyDataset(Dataset):
++    """
++    Concatenate multiple LazyQMDBDataset instances.
++
++    Supports weighted sampling based on dataset weights.
++    """
++
++    def __init__(self, datasets: List[LazyQMDBDataset]):
++        """
++        Initialize concatenated dataset.
++
++        Args:
++            datasets: List of LazyQMDBDataset instances
++        """
++        self.datasets = datasets
++        self.cumulative_sizes = []
++
++        cumsum = 0
++        for ds in datasets:
++            cumsum += len(ds)
++            self.cumulative_sizes.append(cumsum)
++
++    def __len__(self) -> int:
++        return self.cumulative_sizes[-1] if self.cumulative_sizes else 0
++
++    def __getitem__(self, index: int) -> Dict[str, Any]:
++        """Get item from the appropriate sub-dataset."""
++        if index < 0:
++            if -index > len(self):
++                raise IndexError("Index out of range")
++            index = len(self) + index
++
++        # Find which dataset this index belongs to
++        dataset_idx = 0
++        for i, size in enumerate(self.cumulative_sizes):
++            if index < size:
++                dataset_idx = i
++                break
++
++        # Calculate index within the sub-dataset
++        if dataset_idx == 0:
++            sample_idx = index
++        else:
++            sample_idx = index - self.cumulative_sizes[dataset_idx - 1]
++
++        return self.datasets[dataset_idx][sample_idx]
++
++
++class InterleavedLazyDataset(Dataset):
++    """
++    Interleaved dataset that samples from multiple datasets based on probabilities.
++
++    This is useful for mixing datasets with different weights during training.
++    """
++
++    def __init__(
++        self,
++        datasets: List[LazyQMDBDataset],
++        probabilities: Optional[List[float]] = None,
++        seed: int = 42,
++    ):
++        """
++        Initialize interleaved dataset.
++
++        Args:
++            datasets: List of LazyQMDBDataset instances
++            probabilities: Sampling probabilities for each dataset (normalized automatically)
++            seed: Random seed for reproducibility
++        """
++        self.datasets = datasets
++        self.rng = random.Random(seed)
++
++        # Calculate probabilities from weights if not provided
++        if probabilities is None:
++            weights = [ds.config.weight for ds in datasets]
++            total_weight = sum(weights)
++            self.probabilities = [w / total_weight for w in weights]
++        else:
++            total_prob = sum(probabilities)
++            self.probabilities = [p / total_prob for p in probabilities]
++
++        # Pre-compute total length (sum of all datasets)
++        self._total_len = sum(len(ds) for ds in datasets)
++
++    def __len__(self) -> int:
++        return self._total_len
++
++    def __getitem__(self, index: int) -> Dict[str, Any]:
++        """
++        Get item by sampling from datasets based on probabilities.
++
++        Note: The index is used to seed the RNG for deterministic sampling,
++        ensuring reproducibility across epochs.
++        """
++        # Use index to get deterministic but varied dataset selection
++        local_rng = random.Random(index)
++        ds_idx = local_rng.choices(range(len(self.datasets)), weights=self.probabilities)[0]
++
++        # Get sample index within the selected dataset
++        sample_idx = index % len(self.datasets[ds_idx])
++
++        return self.datasets[ds_idx][sample_idx]
+diff --git a/src/llamafactory/data/lazy/loader.py b/src/llamafactory/data/lazy/loader.py
+new file mode 100644
+index 00000000..23025103
+--- /dev/null
++++ b/src/llamafactory/data/lazy/loader.py
+@@ -0,0 +1,712 @@
++# Copyright 2025 the LlamaFactory team.
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++"""
++Lazy QMDB DataLoader integration module.
++
++This module provides the main entry point for creating lazy-loading
++DataLoaders with QMDB (TMDB/LMDB) data sources.
++
++Usage:
++    from llamafactory.data.lazy import get_lazy_qmdb_dataloader
++
++    dataloader = get_lazy_qmdb_dataloader(
++        config_path="path/to/config.yaml",
++        template=template,
++        tokenizer=tokenizer,
++        processor=processor,
++        training_args=training_args,
++    )
++"""
++
++from typing import TYPE_CHECKING, List, Optional, Union
++
++import torch
++from torch.utils.data import DataLoader, DistributedSampler, RandomSampler
++
++from .config import (
++    QMDBDatasetConfig,
++    QMDBLoaderConfig,
++    parse_qmdb_config,
++    parse_qmdb_yaml_datasets,
++)
++from .dataset import ConcatLazyDataset, InterleavedLazyDataset, LazyQMDBDataset
++
++
++if TYPE_CHECKING:
++    from transformers import PreTrainedTokenizer, ProcessorMixin, Seq2SeqTrainingArguments
++
++    from ..collator import MultiModalDataCollatorForSeq2Seq
++    from ..parser import DatasetAttr
++    from ..template import Template
++
++
++def _load_oracle_lengths_cache(cache_path: str) -> dict:
++    """Load oracle length cache and enforce v2 schema (defense in depth).
++
++    Functional metadata validation (template / cutoff_len / image_max_pixels / ...) lives
++    in `data.loader.validate_oracle_cache` since it needs full data_args/model_args; this
++    layer only verifies the cache is loadable, has expected basic shape, and is v2.
++    """
++    import json
++
++    with open(cache_path, "r") as f:
++        cache_data = json.load(f)
++
++    version = cache_data.get("version", 1)
++    if version < 2:
++        raise ValueError(
++            f"Oracle cache at {cache_path} is version {version}; v1 caches lack the "
++            "preprocess_config snapshot needed for safe loading. Regenerate with "
++            "the matching oracle-cache precompute utility (writes v2)."
++        )
++
++    if "lengths" not in cache_data or not isinstance(cache_data["lengths"], list):
++        raise ValueError(f"Oracle cache at {cache_path} missing 'lengths' list field")
++
++    return cache_data
++
++
++def resolve_oracle_lengths(dataset, full_lengths: List[int], cache_path: str) -> List[int]:
++    """Resolve oracle full-dataset lengths to a list aligned with the (possibly Subset) dataset.
++
++    Args:
++        dataset: The dataset that the sampler will index into (may be torch.utils.data.Subset
++                 if val_size split was applied).
++        full_lengths: Lengths of the original (pre-split) dataset, indexed 0..N-1.
++        cache_path: Cache path string, only used in error messages for diagnostics.
++
++    Returns:
++        A list of length `len(dataset)` whose i-th entry is the token length of `dataset[i]`.
++
++    Raises:
++        ValueError if the cache size doesn't match the underlying dataset size, with a
++        descriptive diff. We use ValueError (not assert) so `python -O` cannot skip it.
++    """
++    from torch.utils.data import Subset
++
++    from ...extras import logging
++
++    logger = logging.get_logger(__name__)
++
++    if isinstance(dataset, Subset):
++        underlying_len = len(dataset.dataset)
++        if len(full_lengths) != underlying_len:
++            raise ValueError(
++                f"Oracle cache size mismatch: cache={cache_path} has "
++                f"{len(full_lengths)} lengths but underlying dataset has "
++                f"{underlying_len} samples (diff={len(full_lengths) - underlying_len}). "
++                "Regenerate the oracle cache against the current dataset."
++            )
++        lengths = [full_lengths[i] for i in dataset.indices]
++        logger.info_rank0(
++            f"oracle lengths resolved: full={len(full_lengths)}, used={len(lengths)} "
++            f"(Subset=True, dataset_len={len(dataset)})"
++        )
++        return lengths
++
++    if len(full_lengths) != len(dataset):
++        raise ValueError(
++            f"Oracle cache size mismatch: cache={cache_path} has "
++            f"{len(full_lengths)} lengths but dataset has {len(dataset)} samples "
++            f"(diff={len(full_lengths) - len(dataset)}). "
++            "Regenerate the oracle cache against the current dataset."
++        )
++    logger.info_rank0(
++        f"oracle lengths resolved: full={len(full_lengths)}, used={len(full_lengths)} "
++        f"(Subset=False, dataset_len={len(dataset)})"
++    )
++    return full_lengths
++
++
++def get_lazy_qmdb_dataloader(
++    config_path: str,
++    template: "Template",
++    tokenizer: "PreTrainedTokenizer",
++    processor: Optional["ProcessorMixin"] = None,
++    training_args: Optional["Seq2SeqTrainingArguments"] = None,
++    collator: Optional["MultiModalDataCollatorForSeq2Seq"] = None,
++    cutoff_len: int = 2048,
++    train_on_prompt: bool = False,
++    mask_history: bool = False,
++    use_interleaved: bool = False,
++    disable_shuffling: bool = False,
++    use_odb: bool = False,
++    odb_max_input_length: int = 8192,
++    compute_dtype: Optional["torch.dtype"] = None,
++    use_sorted_batching: bool = False,
++) -> DataLoader:
++    """
++    Create a lazy-loading DataLoader for QMDB data sources.
++
++    This function:
++    1. Parses the configuration file
++    2. Creates lazy datasets for each data source
++    3. Combines datasets (concat or interleaved)
++    4. Creates a DataLoader with the appropriate strategy (standard or ODB)
++
++    Args:
++        config_path: Path to QMDB configuration YAML file
++        template: LlamaFactory template (contains mm_plugin for multimodal)
++        tokenizer: Tokenizer for text encoding
++        processor: Multimodal processor (for Qwen3-VL, etc.)
++        training_args: Training arguments (for batch size, workers, etc.)
++        collator: Data collator (if None, must be set on Trainer)
++        cutoff_len: Maximum sequence length
++        train_on_prompt: Whether to compute loss on prompts
++        mask_history: Whether to mask history turns
++        use_interleaved: If True, use interleaved sampling based on weights
++        disable_shuffling: If True, disable data shuffling
++        use_odb: If True, enable Online Dynamic Batch
++        odb_max_input_length: Maximum input length for ODB calculation
++        compute_dtype: Target dtype for floating point tensors (e.g., torch.bfloat16).
++                       This ensures pixel_values and other tensors use the same dtype
++                       as the standard JSON data path for alignment.
++
++    Returns:
++        Configured DataLoader
++    """
++    # Parse configuration
++    loader_config = parse_qmdb_config(config_path)
++
++    # Override with function parameters
++    loader_config.use_odb = use_odb
++    loader_config.max_input_length = odb_max_input_length
++    loader_config.use_sorted_batching = use_sorted_batching
++
++    # Create datasets
++    datasets = _create_datasets(
++        configs=loader_config.datasets,
++        template=template,
++        tokenizer=tokenizer,
++        processor=processor,
++        cutoff_len=loader_config.cutoff_len or cutoff_len,
++        train_on_prompt=train_on_prompt,
++        mask_history=mask_history,
++    )
++
++    # Combine datasets
++    if len(datasets) == 1:
++        dataset = datasets[0]
++    elif use_interleaved:
++        dataset = InterleavedLazyDataset(datasets)
++    else:
++        dataset = ConcatLazyDataset(datasets)
++
++    # Create DataLoader
++    dataloader = _create_dataloader(
++        dataset=dataset,
++        loader_config=loader_config,
++        training_args=training_args,
++        collator=collator,
++        disable_shuffling=disable_shuffling,
++        tokenizer=tokenizer,
++        compute_dtype=compute_dtype,
++    )
++
++    return dataloader
++
++
++def get_lazy_qmdb_dataloader_from_yaml(
++    yaml_path: str,
++    template: "Template",
++    tokenizer: "PreTrainedTokenizer",
++    processor: Optional["ProcessorMixin"] = None,
++    training_args: Optional["Seq2SeqTrainingArguments"] = None,
++    collator: Optional["MultiModalDataCollatorForSeq2Seq"] = None,
++    cutoff_len: int = 2048,
++    dataloader_type: str = "standard",
++    max_input_length: int = 8192,
++) -> DataLoader:
++    """
++    Create a lazy-loading DataLoader from qqmm-style YAML format.
++
++    This supports the nested category format:
++    ```yaml
++    Caption:
++      ShareCaptioner:
++        data_file: /path/to/tmdb
++        image_dir: /path/to/images
++
++    OCR:
++      synthdog-en:
++        data_file: /path/to/tmdb
++    ```
++
++    Args:
++        yaml_path: Path to the YAML file
++        template: LlamaFactory template
++        tokenizer: Tokenizer
++        processor: Multimodal processor
++        training_args: Training arguments
++        collator: Data collator
++        cutoff_len: Maximum sequence length
++        dataloader_type: One of "standard", "olg", "odb"
++        max_input_length: Maximum input length for ODB
++
++    Returns:
++        Configured DataLoader
++    """
++    # Parse YAML
++    configs = parse_qmdb_yaml_datasets(yaml_path)
++
++    # Create datasets
++    datasets = _create_datasets(
++        configs=configs,
++        template=template,
++        tokenizer=tokenizer,
++        processor=processor,
++        cutoff_len=cutoff_len,
++    )
++
++    # Combine datasets
++    if len(datasets) == 1:
++        dataset = datasets[0]
++    else:
++        dataset = ConcatLazyDataset(datasets)
++
++    # Create loader config
++    loader_config = QMDBLoaderConfig(
++        datasets=configs,
++        use_odb=(dataloader_type == "odb"),
++        max_input_length=max_input_length,
++        cutoff_len=cutoff_len,
++    )
++
++    # Create DataLoader
++    dataloader = _create_dataloader(
++        dataset=dataset,
++        loader_config=loader_config,
++        training_args=training_args,
++        collator=collator,
++        tokenizer=tokenizer,
++    )
++
++    return dataloader
++
++
++def _create_datasets(
++    configs: List[QMDBDatasetConfig],
++    template: "Template",
++    tokenizer: "PreTrainedTokenizer",
++    processor: Optional["ProcessorMixin"] = None,
++    cutoff_len: int = 2048,
++    train_on_prompt: bool = False,
++    mask_history: bool = False,
++) -> List[LazyQMDBDataset]:
++    """
++    Create LazyQMDBDataset instances from configurations.
++
++    Args:
++        configs: List of dataset configurations
++        template: LlamaFactory template
++        tokenizer: Tokenizer
++        processor: Multimodal processor
++        cutoff_len: Maximum sequence length
++        train_on_prompt: Whether to compute loss on prompts
++        mask_history: Whether to mask history turns
++
++    Returns:
++        List of LazyQMDBDataset instances
++    """
++    from ...extras import logging
++
++    logger = logging.get_logger(__name__)
++
++    datasets = []
++    for config in configs:
++        try:
++            ds = LazyQMDBDataset(
++                config=config,
++                template=template,
++                tokenizer=tokenizer,
++                processor=processor,
++                cutoff_len=cutoff_len,
++                train_on_prompt=train_on_prompt,
++                mask_history=mask_history,
++            )
++            datasets.append(ds)
++            logger.info_rank0(f"Loaded lazy dataset '{config.name}' with {len(ds)} samples")
++        except Exception as e:
++            import traceback
++            logger.warning_rank0(f"Failed to load dataset '{config.name}': {e}")
++            logger.warning_rank0(f"Traceback: {traceback.format_exc()}")
++            continue
++
++    if not datasets:
++        raise RuntimeError("No datasets were successfully loaded")
++
++    return datasets
++
++
++def _create_dataloader(
++    dataset: Union[LazyQMDBDataset, ConcatLazyDataset, InterleavedLazyDataset],
++    loader_config: QMDBLoaderConfig,
++    training_args: Optional["Seq2SeqTrainingArguments"] = None,
++    collator: Optional["MultiModalDataCollatorForSeq2Seq"] = None,
++    disable_shuffling: bool = False,
++    tokenizer: Optional["PreTrainedTokenizer"] = None,
++    compute_dtype: Optional["torch.dtype"] = None,
++) -> DataLoader:
++    """
++    Create a DataLoader with the appropriate strategy.
++
++    Args:
++        dataset: Combined dataset
++        loader_config: Loader configuration
++        training_args: Training arguments
++        collator: Data collator
++        disable_shuffling: If True, disable data shuffling
++        tokenizer: Tokenizer (required for ODB/OLG modes)
++        compute_dtype: Target dtype for floating point tensors (for ODB mode)
++
++    Returns:
++        Configured DataLoader
++    """
++    # Determine parameters from training_args or defaults
++    if training_args is not None:
++        batch_size = training_args.per_device_train_batch_size
++        num_workers = getattr(training_args, "dataloader_num_workers", loader_config.preprocessing_num_workers)
++        drop_last = training_args.dataloader_drop_last
++        pin_memory = getattr(training_args, "dataloader_pin_memory", True)
++        prefetch_factor = getattr(training_args, "dataloader_prefetch_factor", 2)
++
++        # Distributed training setup
++        if training_args.world_size > 1:
++            # Token-budget batch samplers (GMT/BMT) - mutually exclusive with sorted and ODB
++            if loader_config.use_global_max_tokens or loader_config.use_bucketed_max_tokens:
++                from ..dataloaders.max_tokens_sampler import (
++                    DistributedGlobalMaxTokensBatchSampler,
++                    DistributedBucketedMaxTokensBatchSampler,
++                )
++                from ..dataloaders.sorted_sampler import get_sample_lengths
++
++                # Load lengths: oracle JSON if provided, else character proxy
++                if loader_config.max_tokens_oracle_cache:
++                    cache_data = _load_oracle_lengths_cache(loader_config.max_tokens_oracle_cache)
++                    lengths = resolve_oracle_lengths(
++                        dataset, cache_data["lengths"], loader_config.max_tokens_oracle_cache
++                    )
++                else:
++                    lengths = get_sample_lengths(dataset)
++
++                # Select appropriate batch sampler class
++                if loader_config.use_global_max_tokens:
++                    BatchSamplerClass = DistributedGlobalMaxTokensBatchSampler
++                else:
++                    BatchSamplerClass = DistributedBucketedMaxTokensBatchSampler
++
++                sampler_kwargs = dict(
++                    lengths=lengths,
++                    max_tokens_budget=loader_config.max_tokens_budget,
++                    num_replicas=training_args.world_size,
++                    rank=training_args.process_index,
++                    shuffle=not disable_shuffling,
++                    seed=training_args.seed,
++                )
++                if loader_config.use_bucketed_max_tokens:
++                    sampler_kwargs["bucket_size"] = loader_config.max_tokens_bucket_size
++
++                batch_sampler = BatchSamplerClass(**sampler_kwargs)
++
++                # Return early with batch_sampler DataLoader
++                return DataLoader(
++                    dataset,
++                    batch_sampler=batch_sampler,
++                    collate_fn=collator,
++                    num_workers=num_workers,
++                    pin_memory=pin_memory,
++                    prefetch_factor=prefetch_factor if num_workers > 0 else None,
++                )
++
++            if loader_config.use_hf_group_by_length:
++                from transformers.trainer_pt_utils import DistributedLengthGroupedSampler
++
++                from ..dataloaders.sorted_sampler import get_sample_lengths
++
++                # Load lengths: oracle JSON if provided, else character proxy.
++                if loader_config.max_tokens_oracle_cache:
++                    cache_data = _load_oracle_lengths_cache(loader_config.max_tokens_oracle_cache)
++                    lengths = resolve_oracle_lengths(
++                        dataset, cache_data["lengths"], loader_config.max_tokens_oracle_cache
++                    )
++                else:
++                    lengths = get_sample_lengths(dataset)
++
++                group_batch_size = batch_size * max(1, getattr(training_args, "gradient_accumulation_steps", 1))
++                sampler = DistributedLengthGroupedSampler(
++                    batch_size=group_batch_size,
++                    dataset=dataset,
++                    lengths=lengths,
++                    num_replicas=training_args.world_size,
++                    rank=training_args.process_index,
++                    seed=training_args.seed,
++                    drop_last=drop_last,
++                )
++                shuffle = False
++            elif loader_config.use_sorted_batching:
++                # Use sorted sampler for reduced padding
++                from ..dataloaders.sorted_sampler import DistributedSortedSampler, get_sample_lengths
++
++                lengths = get_sample_lengths(dataset)
++                sampler = DistributedSortedSampler(
++                    dataset,
++                    lengths=lengths,
++                    num_replicas=training_args.world_size,
++                    rank=training_args.process_index,
++                    drop_last=drop_last,
++                )
++            else:
++                sampler = DistributedSampler(
++                    dataset,
++                    num_replicas=training_args.world_size,
++                    rank=training_args.process_index,
++                    shuffle=not disable_shuffling,
++                )
++            shuffle = False
++        else:
++            # Token-budget batch samplers (GMT/BMT) - single GPU
++            if loader_config.use_global_max_tokens or loader_config.use_bucketed_max_tokens:
++                from ..dataloaders.max_tokens_sampler import (
++                    GlobalMaxTokensBatchSampler,
++                    BucketedMaxTokensBatchSampler,
++                )
++                from ..dataloaders.sorted_sampler import get_sample_lengths
++
++                # Load lengths: oracle JSON if provided, else character proxy
++                if loader_config.max_tokens_oracle_cache:
++                    cache_data = _load_oracle_lengths_cache(loader_config.max_tokens_oracle_cache)
++                    lengths = resolve_oracle_lengths(
++                        dataset, cache_data["lengths"], loader_config.max_tokens_oracle_cache
++                    )
++                else:
++                    lengths = get_sample_lengths(dataset)
++
++                # Select appropriate batch sampler class
++                if loader_config.use_global_max_tokens:
++                    BatchSamplerClass = GlobalMaxTokensBatchSampler
++                else:
++                    BatchSamplerClass = BucketedMaxTokensBatchSampler
++
++                # Pass training seed to single-GPU samplers as well so multi-seed runs
++                # produce different batch orders (parity with distributed path).
++                _seed = training_args.seed if training_args is not None else 0
++                sampler_kwargs = dict(
++                    lengths=lengths,
++                    max_tokens_budget=loader_config.max_tokens_budget,
++                    shuffle=not disable_shuffling,
++                    seed=_seed,
++                )
++                if loader_config.use_bucketed_max_tokens:
++                    sampler_kwargs["bucket_size"] = loader_config.max_tokens_bucket_size
++
++                batch_sampler = BatchSamplerClass(**sampler_kwargs)
++
++                # Return early with batch_sampler DataLoader
++                return DataLoader(
++                    dataset,
++                    batch_sampler=batch_sampler,
++                    collate_fn=collator,
++                    num_workers=num_workers,
++                    pin_memory=pin_memory,
++                    prefetch_factor=prefetch_factor if num_workers > 0 else None,
++                )
++
++            if loader_config.use_hf_group_by_length:
++                from transformers.trainer_pt_utils import LengthGroupedSampler
++
++                from ..dataloaders.sorted_sampler import get_sample_lengths
++
++                # Load lengths: oracle JSON if provided, else character proxy.
++                if loader_config.max_tokens_oracle_cache:
++                    cache_data = _load_oracle_lengths_cache(loader_config.max_tokens_oracle_cache)
++                    lengths = resolve_oracle_lengths(
++                        dataset, cache_data["lengths"], loader_config.max_tokens_oracle_cache
++                    )
++                else:
++                    lengths = get_sample_lengths(dataset)
++
++                group_batch_size = batch_size * max(1, getattr(training_args, "gradient_accumulation_steps", 1))
++                generator = torch.Generator()
++                generator.manual_seed(training_args.seed)
++                sampler = LengthGroupedSampler(
++                    batch_size=group_batch_size,
++                    dataset=dataset,
++                    lengths=lengths,
++                    generator=generator,
++                )
++                shuffle = False
++            elif loader_config.use_sorted_batching:
++                from ..dataloaders.sorted_sampler import SortedSampler, get_sample_lengths
++
++                lengths = get_sample_lengths(dataset)
++                sampler = SortedSampler(dataset, lengths=lengths)
++                shuffle = False
++            else:
++                sampler = None
++                shuffle = not disable_shuffling
++    else:
++        batch_size = 1
++        num_workers = loader_config.preprocessing_num_workers
++        drop_last = False
++        pin_memory = True
++        prefetch_factor = 2
++        sampler = None
++        shuffle = not disable_shuffling
++
++    # For ODB, we need num_workers > 0
++    if loader_config.use_odb and num_workers == 0:
++        num_workers = 4
++        import warnings
++        warnings.warn(
++            f"ODB DataLoader requires num_workers > 0, setting to {num_workers}"
++        )
++
++    # Lazy QMDB datasets already return fully processed tensor samples. Use
++    # SimpleCollator for all lazy loaders, including Standard baselines; the
++    # original multimodal collator expects list[int] token fields.
++    if tokenizer is not None:
++        from .collator import create_simple_collator
++        collator = create_simple_collator(tokenizer, compute_dtype=compute_dtype)
++
++    if loader_config.use_odb:
++        torch.multiprocessing.set_sharing_strategy("file_system")
++
++    # Create DataLoader
++    dataloader = DataLoader(
++        dataset,
++        batch_size=batch_size,
++        shuffle=shuffle if sampler is None else False,
++        sampler=sampler,
++        num_workers=num_workers,
++        collate_fn=collator,
++        pin_memory=pin_memory,
++        drop_last=drop_last,
++        prefetch_factor=prefetch_factor if num_workers > 0 else None,
++    )
++
++    # Apply ODB if enabled
++    if loader_config.use_odb:
++        if dataloader.batch_size != 1:
++            import logging as _logging
++
++            _logging.getLogger(__name__).info(
++                f"[ODB] DataLoader batch_size overridden: {dataloader.batch_size} -> 1"
++            )
++            dataloader = DataLoader(
++                dataset,
++                batch_size=1,
++                shuffle=shuffle if sampler is None else False,
++                sampler=sampler,
++                num_workers=num_workers,
++                collate_fn=collator,
++                pin_memory=pin_memory,
++                drop_last=False,
++                prefetch_factor=prefetch_factor if num_workers > 0 else None,
++            )
++
++    if loader_config.use_odb and loader_config.defer_odb_apply_to_trainer:
++        return dataloader
++
++    if loader_config.use_odb:
++        from ..dataloaders import apply_odb
++
++        apply_odb(
++            dataloader,
++            loader_config.max_input_length,
++            version=loader_config.odb_version,
++            join_mode=loader_config.odb_join_mode,
++            loss_scaling_mode=loader_config.odb_loss_scaling_mode,
++            no_warmup=loader_config.odb_no_warmup,
++            no_sync=loader_config.odb_no_sync,
++            buffer_size=loader_config.odb_buffer_size,
++            max_patches=loader_config.odb_max_patches,
++        )
++
++    return dataloader
++
++
++def create_lazy_collator(
++    template: "Template",
++    tokenizer: "PreTrainedTokenizer",
++    processor: Optional["ProcessorMixin"] = None,
++    model=None,
++    pad_to_multiple_of: int = 8,
++) -> "MultiModalDataCollatorForSeq2Seq":
++    """
++    Create a MultiModalDataCollatorForSeq2Seq for lazy datasets.
++
++    This is a convenience function to create the appropriate collator
++    for use with lazy QMDB datasets.
++
++    Args:
++        template: LlamaFactory template
++        tokenizer: Tokenizer
++        processor: Multimodal processor
++        model: Model (for rope index calculation in Qwen-VL)
++        pad_to_multiple_of: Pad sequences to multiple of this value
++
++    Returns:
++        Configured collator
++    """
++    from ..collator import MultiModalDataCollatorForSeq2Seq
++
++    return MultiModalDataCollatorForSeq2Seq(
++        template=template,
++        tokenizer=tokenizer,
++        processor=processor,
++        model=model,
++        pad_to_multiple_of=pad_to_multiple_of,
++        padding=True,
++        return_tensors="pt",
++    )
++
++
++def dataset_attr_to_qmdb_config(attr: "DatasetAttr") -> QMDBDatasetConfig:
++    """
++    Convert a DatasetAttr (from dataset_info.json) to QMDBDatasetConfig (for QMDB lazy loader).
++
++    Standard DatasetAttr fields are mapped directly. QMDB-specific fields
++    (image_dir, extra_path, weight, prompt as fixed text) are read from attr.extra.
++
++    Note on "prompt" semantics:
++    - DatasetAttr.prompt is a column name (default "instruction") for alpaca format
++    - QMDBDatasetConfig.prompt is a fixed prompt text (e.g., "Recognize text in the image")
++    - The mapping uses attr.extra.get("prompt") for the fixed prompt text
++    - DatasetAttr.prompt (column name) maps to QMDBDatasetConfig.instruction_key
++    """
++    return QMDBDatasetConfig(
++        name=str(attr),  # dataset_name (tmdb_file path)
++        data_file=attr.dataset_name,  # tmdb_file path stored in dataset_name
++        formatting=attr.formatting,
++        max_samples=attr.num_samples,
++        # Standard columns mapping
++        messages_key=attr.messages or "conversations",
++        images_key=attr.images or "images",
++        # Alpaca column name mapping
++        instruction_key=attr.prompt or "instruction",
++        input_key=attr.query or "input",
++        output_key=attr.response or "output",
++        # ShareGPT tags mapping
++        role_tag=attr.role_tag or "from",
++        content_tag=attr.content_tag or "value",
++        user_tag=attr.user_tag or "human",
++        assistant_tag=attr.assistant_tag or "gpt",
++        system_tag=attr.system_tag or "system",
++        # QMDB-specific fields from extra dict
++        image_dir=attr.extra.get("image_dir"),
++        extra_path=attr.extra.get("extra_path"),
++        weight=attr.extra.get("weight", 1.0),
++        prompt=attr.extra.get("prompt"),  # fixed prompt text, NOT column name
++    )
+diff --git a/src/llamafactory/data/loader.py b/src/llamafactory/data/loader.py
+index d3d44e6f..a61750d2 100644
+--- a/src/llamafactory/data/loader.py
++++ b/src/llamafactory/data/loader.py
+@@ -283,6 +283,30 @@ def get_dataset(
+     processor: Optional["ProcessorMixin"] = None,
+ ) -> "DatasetModule":
+     r"""Get the train dataset and optionally gets the evaluation dataset."""
++    # Check if dataset list contains tmdb type datasets (via dataset_info.json)
++    dataset_list = get_dataset_list(data_args.dataset, data_args.dataset_dir)
++    tmdb_attrs = [a for a in dataset_list if a.load_from == "tmdb"]
++    non_tmdb_attrs = [a for a in dataset_list if a.load_from != "tmdb"]
++
++    if tmdb_attrs and non_tmdb_attrs:
++        raise ValueError(
++            "Mixing TMDB datasets with other dataset types is not supported in the current version. "
++            f"TMDB datasets: {[str(a) for a in tmdb_attrs]}, "
++            f"Other datasets: {[str(a) for a in non_tmdb_attrs]}. "
++            "Please use only TMDB datasets or only standard datasets in a single training run."
++        )
++
++    if tmdb_attrs:
++        return _get_tmdb_dataset_from_attrs(
++            tmdb_attrs=tmdb_attrs,
++            template=template,
++            model_args=model_args,
++            data_args=data_args,
++            training_args=training_args,
++            tokenizer=tokenizer,
++            processor=processor,
++        )
++
+     # Load tokenized dataset if path exists
+     if data_args.tokenized_path is not None:
+         if has_tokenized_data(data_args.tokenized_path):
+@@ -333,4 +357,281 @@ def get_dataset(
+                 logger.info_rank0(f"Tokenized dataset is saved at {data_args.tokenized_path}.")
+                 logger.info_rank0(f"Please launch the training with `tokenized_path: {data_args.tokenized_path}`.")
+ 
+-        return get_dataset_module(dataset_dict)
++        dataset_module = get_dataset_module(dataset_dict)
++
++        # Add ODB configuration if enabled
++        if data_args.use_odb:
++            dataset_module["_use_odb"] = True
++            dataset_module["_odb_max_input_length"] = data_args.odb_max_input_length
++            dataset_module["_odb_version"] = data_args.odb_version
++            dataset_module["_odb_join_mode"] = data_args.odb_join_mode
++            dataset_module["_odb_loss_scaling_mode"] = data_args.odb_loss_scaling_mode
++            dataset_module["_odb_no_warmup"] = data_args.odb_no_warmup
++            dataset_module["_odb_no_sync"] = data_args.odb_no_sync
++            dataset_module["_odb_buffer_size"] = data_args.odb_buffer_size
++            dataset_module["_odb_max_patches"] = data_args.odb_max_patches
++            logger.info_rank0(
++                f"ODB v{data_args.odb_version} enabled: max_input_length={data_args.odb_max_input_length}, "
++                f"batch_size will be dynamically calculated as max_input_length/sequence_length"
++            )
++
++        return dataset_module
++
++
++def validate_oracle_cache(
++    cache_path: str,
++    data_args: "DataArguments",
++    model_args: "ModelArguments",
++    template: "Template",
++    tokenizer: "PreTrainedTokenizer",
++    processor: Optional["ProcessorMixin"] = None,
++) -> None:
++    """Verify a v2 oracle cache was produced under settings compatible with the current run.
++
++    Raises ValueError on:
++      - missing / unreadable cache file
++      - v1 cache (lacks preprocess_config; cannot be safely validated)
++      - any hard-validated field mismatch
++
++    Hard-validated fields (mismatch -> raise):
++        dataset, template, default_system (template-effective), cutoff_len,
++        mask_history, train_on_prompt, image_max_pixels, image_min_pixels,
++        tokenizer_class, tokenizer_vocab_size, processor_class,
++        image_processor_class, image_processor_patch_size, image_processor_merge_size
++
++    Diagnostic-only (recorded but not validated): model_name_or_path
++        Reason: 2B/8B Qwen3-VL share tokenizer/processor; storage paths differ
++        but yield identical input_ids. Functional checks above are sufficient.
++    """
++    import json as _json
++
++    if not os.path.exists(cache_path):
++        raise ValueError(f"Oracle cache not found: {cache_path}")
++
++    with open(cache_path, "r") as f:
++        cache_data = _json.load(f)
++
++    version = cache_data.get("version", 1)
++    if version < 2:
++        raise ValueError(
++            f"Oracle cache at {cache_path} is version {version}; v1 caches lack the "
++            "preprocess_config snapshot needed for safe validation. Regenerate with "
++            "the matching oracle-cache precompute utility (writes v2)."
++        )
++
++    cache_cfg = cache_data.get("preprocess_config")
++    if not isinstance(cache_cfg, dict):
++        raise ValueError(
++            f"Oracle cache at {cache_path} missing 'preprocess_config' field "
++            "(should be present in v2). Regenerate the cache."
++        )
++
++    # Build current-run snapshot using the same shape as the precompute script.
++    img_proc = getattr(processor, "image_processor", None) if processor is not None else None
++    current_cfg = {
++        "dataset": data_args.dataset,
++        "template": data_args.template,
++        "default_system": template.default_system,  # template-effective value
++        "cutoff_len": data_args.cutoff_len,
++        "mask_history": getattr(data_args, "mask_history", False),
++        "train_on_prompt": getattr(data_args, "train_on_prompt", False),
++        "image_max_pixels": getattr(model_args, "image_max_pixels", None),
++        "image_min_pixels": getattr(model_args, "image_min_pixels", None),
++        "tokenizer_class": type(tokenizer).__name__,
++        "tokenizer_vocab_size": getattr(tokenizer, "vocab_size", None),
++        "processor_class": type(processor).__name__ if processor is not None else None,
++        "image_processor_class": type(img_proc).__name__ if img_proc is not None else None,
++        "image_processor_patch_size": getattr(img_proc, "patch_size", None),
++        "image_processor_merge_size": getattr(img_proc, "merge_size", None),
++    }
++
++    mismatches = []
++    for key, expected in current_cfg.items():
++        cached = cache_cfg.get(key, "<MISSING>")
++        if cached != expected:
++            mismatches.append((key, expected, cached))
++
++    if mismatches:
++        details = "\n".join(
++            f"  - {k}: current={cur!r}, cache={cache!r}" for k, cur, cache in mismatches
++        )
++        raise ValueError(
++            f"Oracle cache {cache_path} mismatch with current run "
++            f"(cache 'model_diag'={cache_data.get('model_diag', {})}):\n{details}\n"
++            "The cache must be regenerated against the current dataset/template/model "
++            "settings via the matching oracle-cache precompute utility."
++        )
++
++    logger.info_rank0(
++        f"Oracle cache {cache_path} passed validation "
++        f"(n={cache_data.get('num_samples')}, sha256={cache_data.get('lengths_sha256', '?')[:12]}...)"
++    )
++
++
++def _get_tmdb_dataset_from_attrs(
++    tmdb_attrs: list["DatasetAttr"],
++    template: "Template",
++    model_args: "ModelArguments",
++    data_args: "DataArguments",
++    training_args: "Seq2SeqTrainingArguments",
++    tokenizer: "PreTrainedTokenizer",
++    processor: Optional["ProcessorMixin"] = None,
++) -> "DatasetModule":
++    """
++    Get lazy-loading TMDB dataset from DatasetAttr list (new path via dataset_info.json).
++
++    This function converts DatasetAttr objects to QMDBDatasetConfig objects and
++    reuses the existing lazy QMDB dataloader infrastructure.
++    """
++    from .lazy import create_lazy_collator
++    from .lazy.config import QMDBLoaderConfig
++    from .lazy.loader import _create_dataloader, _create_datasets, dataset_attr_to_qmdb_config
++
++    logger.info_rank0(f"Loading TMDB datasets via dataset_info.json: {[str(a) for a in tmdb_attrs]}")
++
++    # Convert DatasetAttr to QMDBDatasetConfig
++    configs = [dataset_attr_to_qmdb_config(attr) for attr in tmdb_attrs]
++
++    # Debug log for alignment testing: print full QMDBDatasetConfig
++    for cfg in configs:
++        logger.info_rank0(
++            f"[TMDB via dataset_info] QMDBDatasetConfig: name={cfg.name}, data_file={cfg.data_file}, "
++            f"formatting={cfg.formatting}, max_samples={cfg.max_samples}, weight={cfg.weight}, "
++            f"image_dir={cfg.image_dir}, extra_path={cfg.extra_path}, prompt={cfg.prompt}, "
++            f"messages_key={cfg.messages_key}, images_key={cfg.images_key}, "
++            f"role_tag={cfg.role_tag}, content_tag={cfg.content_tag}, "
++            f"user_tag={cfg.user_tag}, assistant_tag={cfg.assistant_tag}"
++        )
++
++    # Build loader config
++    defer_odb_apply_to_trainer = bool(data_args.use_odb and data_args.odb_version == 51)
++    loader_config = QMDBLoaderConfig(
++        datasets=configs,
++        use_odb=data_args.use_odb,
++        defer_odb_apply_to_trainer=defer_odb_apply_to_trainer,
++        odb_version=data_args.odb_version,
++        odb_join_mode=data_args.odb_join_mode,
++        odb_loss_scaling_mode=data_args.odb_loss_scaling_mode,
++        odb_no_warmup=data_args.odb_no_warmup,
++        odb_no_sync=data_args.odb_no_sync,
++        odb_buffer_size=data_args.odb_buffer_size,
++        max_input_length=data_args.odb_max_input_length,
++        cutoff_len=data_args.cutoff_len,
++        use_sorted_batching=data_args.use_sorted_batching,
++        use_hf_group_by_length=data_args.use_hf_group_by_length,
++        use_global_max_tokens=data_args.use_global_max_tokens,
++        use_bucketed_max_tokens=data_args.use_bucketed_max_tokens,
++        max_tokens_budget=data_args.max_tokens_budget,
++        max_tokens_bucket_size=data_args.max_tokens_bucket_size,
++        max_tokens_oracle_cache=data_args.max_tokens_oracle_cache,
++    )
++
++    # Create datasets (reuse existing infrastructure)
++    datasets = _create_datasets(
++        configs=configs,
++        template=template,
++        tokenizer=tokenizer,
++        processor=processor,
++        cutoff_len=data_args.cutoff_len,
++        train_on_prompt=data_args.train_on_prompt,
++        mask_history=data_args.mask_history,
++    )
++
++    # Combine datasets
++    from .lazy.dataset import ConcatLazyDataset
++
++    if len(datasets) == 1:
++        dataset = datasets[0]
++    else:
++        dataset = ConcatLazyDataset(datasets)
++
++    # Split train/eval if val_size is specified
++    eval_dataset = None
++    if data_args.val_size > 1e-6:
++        import numpy as np
++        from torch.utils.data import Subset
++
++        total_len = len(dataset)
++        val_size = int(data_args.val_size) if data_args.val_size > 1 else int(total_len * data_args.val_size)
++        val_size = max(1, min(val_size, total_len - 1))  # at least 1 sample for each split
++
++        # Deterministic split using training seed
++        rng = np.random.default_rng(training_args.seed)
++        indices = rng.permutation(total_len)
++        eval_indices = indices[:val_size].tolist()
++        train_indices = indices[val_size:].tolist()
++
++        eval_dataset = Subset(dataset, eval_indices)
++        dataset = Subset(dataset, train_indices)
++
++        logger.info_rank0(
++            f"Split TMDB dataset: train={len(train_indices)}, eval={len(eval_indices)} "
++            f"(val_size={data_args.val_size}, seed={training_args.seed})"
++        )
++
++    # Validate oracle cache (when an oracle length baseline is enabled) before constructing
++    # the dataloader. Mismatches between the cache's preprocess_config and the current
++    # data_args/model_args raise ValueError; v1 caches are rejected outright.
++    if (
++        (
++            data_args.use_global_max_tokens
++            or data_args.use_bucketed_max_tokens
++            or data_args.use_hf_group_by_length
++        )
++        and data_args.max_tokens_oracle_cache
++    ):
++        validate_oracle_cache(
++            cache_path=data_args.max_tokens_oracle_cache,
++            data_args=data_args,
++            model_args=model_args,
++            template=template,
++            tokenizer=tokenizer,
++            processor=processor,
++        )
++
++    # Create collator
++    collator = create_lazy_collator(
++        template=template,
++        tokenizer=tokenizer,
++        processor=processor,
++        model=None,  # Will be set by Trainer
++    )
++
++    # Create dataloader (reuse existing infrastructure)
++    dataloader = _create_dataloader(
++        dataset=dataset,
++        loader_config=loader_config,
++        training_args=training_args,
++        collator=collator,
++        tokenizer=tokenizer,
++        compute_dtype=model_args.compute_dtype,
++    )
++
++    dataloader_type = "odb" if data_args.use_odb else "standard"
++    logger.info_rank0(
++        f"Created TMDB lazy dataloader (via dataset_info) with type '{dataloader_type}', "
++        f"dataset size: {len(dataloader.dataset)}, dataloader len: {len(dataloader)}, "
++        f"sampler: {type(dataloader.sampler).__name__}"
++    )
++
++    # Return as DatasetModule (same format as _get_qmdb_lazy_dataset)
++    dataset_module = {
++        "train_dataset": dataloader.dataset,
++        "_lazy_dataloader": dataloader,
++        "_lazy_collator": collator,
++        "_use_odb": data_args.use_odb,
++        "_enable_odb_with_package": defer_odb_apply_to_trainer,
++        "_odb_max_input_length": data_args.odb_max_input_length,
++        "_odb_version": data_args.odb_version,
++        "_odb_join_mode": data_args.odb_join_mode,
++        "_odb_loss_scaling_mode": data_args.odb_loss_scaling_mode,
++        "_odb_no_warmup": data_args.odb_no_warmup,
++        "_odb_no_sync": data_args.odb_no_sync,
++        "_odb_buffer_size": data_args.odb_buffer_size,
++        "_odb_max_patches": data_args.odb_max_patches,
++    }
++
++    if eval_dataset is not None:
++        dataset_module["eval_dataset"] = eval_dataset
++
++    return dataset_module
+diff --git a/src/llamafactory/data/parser.py b/src/llamafactory/data/parser.py
+index 5209da64..bde80452 100644
+--- a/src/llamafactory/data/parser.py
++++ b/src/llamafactory/data/parser.py
+@@ -14,7 +14,7 @@
+ 
+ import json
+ import os
+-from dataclasses import dataclass
++from dataclasses import dataclass, field
+ from typing import Any, Literal
+ 
+ from huggingface_hub import hf_hub_download
+@@ -28,7 +28,7 @@ class DatasetAttr:
+     r"""Dataset attributes."""
+ 
+     # basic configs
+-    load_from: Literal["hf_hub", "ms_hub", "om_hub", "script", "file"]
++    load_from: Literal["hf_hub", "ms_hub", "om_hub", "script", "file", "tmdb"]
+     dataset_name: str
+     formatting: Literal["alpaca", "sharegpt", "openai"] = "alpaca"
+     ranking: bool = False
+@@ -62,6 +62,7 @@ class DatasetAttr:
+     observation_tag: str | None = "observation"
+     function_tag: str | None = "function_call"
+     system_tag: str | None = "system"
++    extra: dict[str, Any] = field(default_factory=dict)
+ 
+     def __repr__(self) -> str:
+         return self.dataset_name
+@@ -89,6 +90,25 @@ class DatasetAttr:
+             for tag in tag_names:
+                 self.set_attr(tag, attr["tags"])
+ 
++        known = {
++            "formatting",
++            "ranking",
++            "subset",
++            "split",
++            "folder",
++            "num_samples",
++            "columns",
++            "tags",
++            "hf_hub_url",
++            "ms_hub_url",
++            "om_hub_url",
++            "script_url",
++            "cloud_file_name",
++            "file_name",
++            "tmdb_file",
++        }
++        self.extra = {key: value for key, value in attr.items() if key not in known}
++
+ 
+ def get_dataset_list(dataset_names: list[str] | None, dataset_dir: str | dict) -> list["DatasetAttr"]:
+     r"""Get the attributes of the datasets."""
+@@ -140,6 +160,8 @@ def get_dataset_list(dataset_names: list[str] | None, dataset_dir: str | dict) -
+             dataset_attr = DatasetAttr("script", dataset_name=dataset_info[name]["script_url"])
+         elif "cloud_file_name" in dataset_info[name]:
+             dataset_attr = DatasetAttr("cloud_file", dataset_name=dataset_info[name]["cloud_file_name"])
++        elif "tmdb_file" in dataset_info[name]:
++            dataset_attr = DatasetAttr("tmdb", dataset_name=dataset_info[name]["tmdb_file"])
+         else:
+             dataset_attr = DatasetAttr("file", dataset_name=dataset_info[name]["file_name"])
+ 
+diff --git a/src/llamafactory/data/qmdb/__init__.py b/src/llamafactory/data/qmdb/__init__.py
+new file mode 100644
+index 00000000..7b54a26b
+--- /dev/null
++++ b/src/llamafactory/data/qmdb/__init__.py
+@@ -0,0 +1 @@
++from .reader import load
+diff --git a/src/llamafactory/data/qmdb/lmdbs.py b/src/llamafactory/data/qmdb/lmdbs.py
+new file mode 100644
+index 00000000..27eea679
+--- /dev/null
++++ b/src/llamafactory/data/qmdb/lmdbs.py
+@@ -0,0 +1,327 @@
++from typing import Optional, List, Dict, Set
++import os
++import glob
++from collections import OrderedDict
++import lmdb
++
++
++LMDB_EXTS = {'.lmdb', '.mdb'}
++
++
++def alphanum_path_key(s: str):
++    """Use to sort string by numbers in it, useful when numbers in string are not matched in digit (1 and 001)."""
++    s = os.path.splitext(s)[0]
++    digit_key_list = []
++    str_section = ''
++    is_digit = False
++    for c in s:
++        if c.isdigit() == is_digit:
++            str_section += c
++        else:
++            if is_digit:
++                digit_key_list.append(int(str_section))
++            else:
++                digit_key_list.append(str_section)
++            str_section, is_digit = c, c.isdigit()
++    if is_digit:
++        digit_key_list.append(int(str_section))
++    else:
++        digit_key_list.append(str_section)
++    return digit_key_list
++
++
++class LMDBData:
++    def __init__(self, path: str, env: lmdb.Environment):
++        self.path = path
++        self.env = env
++
++        self._keys_file = self.path + '-keys'
++        self.keys = self._init_keys()
++        self._keys_buffer = []
++        self._has_pop_keys = False
++
++        self._txn = None
++        if self.readonly:
++            self._txn = self.txn
++
++    @property
++    def txn(self):
++        if self._txn is None:
++            self._txn = self.env.begin(write=not self.readonly)
++        return self._txn
++
++    @staticmethod
++    def open(path: str, map_size: int = 4*1024*1024*1024,
++             subdir: Optional[bool] = None, readonly: bool = True, *args, max_dbs=128, **kwargs):
++        subdir = bool(subdir)
++        assert subdir is False, "'subdir' must be None or False."
++
++        env = lmdb.Environment(path, map_size, subdir, readonly, *args, max_dbs=max_dbs, **kwargs)
++
++        return LMDBData(path, env)
++
++    def _init_keys(self):
++        if os.path.exists(self._keys_file):
++            with open(self._keys_file) as f:
++                keys = f.read().splitlines()
++        else:
++            keys = None
++
++        txn = self.env.begin(write=False)
++        if keys is None or len(keys) != txn.stat()['entries']:
++            keys = []
++            for k in txn.cursor().iternext(values=False):
++                keys.append(k.decode('utf-8'))
++            with open(self._keys_file, 'w') as f:
++                f.writelines(k + '\n' for k in keys)
++        else:
++            txn.abort()
++
++        keys = OrderedDict((k, None) for k in keys)
++
++        return keys
++
++    def get(self, key: str, default=None):
++        return self.txn.get(key.encode(), default)
++
++    def put(self, key: str, value: bytes, *, overwrite=True, append=False, **kwargs):
++        if key in self.keys:
++            if not overwrite:
++                raise KeyError(f"Key already exists when not overwrite: {key}")
++            flag = 2
++        else:
++            flag = 1
++
++        rt = self.txn.put(key.encode(), value, overwrite=overwrite, append=append, **kwargs)
++
++        if not rt:
++            raise RuntimeError(f"Failed to put {key} to lmdb")
++
++        if flag == 1:
++            self.keys[key] = None
++            self._keys_buffer.append(key)
++
++        return flag
++
++    def pop(self, key: str):
++        self.txn.pop(key.encode())
++        self.keys.pop(key)
++        self._has_pop_keys = True
++
++    def commit(self):
++        if self._txn is not None:
++            self._txn.commit()
++            self._txn = None
++
++        if self._has_pop_keys:
++            with open(self._keys_file, 'w') as f:
++                f.writelines(k + '\n' for k in self.keys)
++        else:
++            with open(self._keys_file, 'a') as f:
++                f.writelines(k + '\n' for k in self._keys_buffer)
++
++        self.abort()
++
++    def abort(self):
++        if self._txn is not None:
++            self._txn.abort()
++            self._txn = None
++        self._keys_buffer.clear()
++        self._has_pop_keys = False
++
++    @property
++    def readonly(self):
++        return self.env.flags()['readonly']
++
++    def close(self):
++        self.abort()
++        self.env.close()
++
++    def __len__(self):
++        return self.env.stat()['entries']
++
++    def __del__(self):
++        self.close()
++
++
++class ExtendLMDBData:
++    def __init__(self, path: str, datas: List[LMDBData], map_size: int):
++        self.path = path
++        self.datas = datas
++        self.map_size = map_size
++        self._buffer = []
++
++        self.mapping = self._init_mapping()
++
++    @classmethod
++    def open(cls, path: str, map_size: int = 4*1024*1024*1024, subdir: Optional[bool] = None, readonly: bool = True,
++             *args, exts: Optional[Set[str]] = None, **kwargs):
++        paths = cls._parse_path(path, exts)
++        datas = [LMDBData.open(p, map_size, subdir, readonly, *args, **kwargs) for p in paths]
++
++        return cls(path, datas, map_size)
++
++    @classmethod
++    def dump(cls, data: Dict[str, bytes], path: str, map_size: int = 4*1024*1024*1024,
++             subdir: Optional[bool] = None, readonly: bool = False, *args, commit_size=256, **kwargs):
++        assert isinstance(data, dict), f"dump data must be a dictionary, rather than a {type(data)}."
++        for value in data.values():
++            assert isinstance(value, dict), f"value in data must be a dictionary, rather than a {type(value)}."
++
++        lmdbs = cls.open(path, map_size, subdir, readonly, *args, **kwargs)
++
++        commit_size_ = commit_size - 1
++        for i, (key, value) in enumerate(data.items()):
++            lmdbs.put(key, value, append=True)
++            if i % commit_size == commit_size_:
++                lmdbs.commit(append=True)
++        lmdbs.commit(append=True)
++        lmdbs.abort()
++
++    @classmethod
++    def _parse_path(cls, path: str, exts: Optional[Set[str]] = None):
++        if exts is None:
++            exts = LMDB_EXTS
++
++        if isinstance(path, list):
++            paths = path
++        elif glob.has_magic(path):
++            paths = sorted(glob.glob(path), key=alphanum_path_key)
++        elif not os.path.exists(path):
++            paths = [cls._create_path(path)]
++        elif os.path.isdir(path):
++            paths = sorted(glob.glob(os.path.join(path, '*')), key=alphanum_path_key)
++            paths = [p for p in paths if os.path.splitext(p)[1] in exts]
++        else:
++            paths = [path]
++
++        if not len(paths):
++            raise FileNotFoundError(f"Cannot find lmdb data files in path: {path}.")
++
++        return paths
++
++    @staticmethod
++    def _create_path(path: str):
++        ext = os.path.splitext(path)[1]
++        if ext == '':
++            folder = path
++            file = os.path.join(path, 'data.lmdb')
++        else:
++            folder = os.path.dirname(path)
++            file = path
++
++        if not os.path.exists(folder):
++            os.mkdir(folder)
++
++        return file
++
++    def _init_mapping(self):
++        mapping = {}
++        _counts = {}
++        for i, data in enumerate(self.datas):
++            for k in data.keys:
++                n = _counts.get(k, 0)
++                _counts[k] = n + 1
++                k = (k, n) if n else k
++                mapping[k] = i
++
++        return mapping
++
++    def _extend_lmdb(self):
++        assert not self.readonly, "Failed to extend_lmdb, cannot extend in readonly mode."
++        assert len(self.datas) > 0, "Failed to extend_lmdb, no existing lmdb."
++        path = self.path if os.path.isfile(self.path) else self.datas[0].path
++        index = len(self.datas)
++
++        _buffer = self._buffer.copy()
++        self.abort()
++
++        dn, fn = os.path.split(path)
++        fn, ext = os.path.splitext(fn)
++        path = f"{dn}/{fn}-{index}{ext}"
++
++        data = LMDBData.open(path, map_size=self.map_size, subdir=False, readonly=False)
++        self.datas.append(data)
++
++        for key, value in _buffer:
++            self.put(key, value, append=True)
++
++        return index
++
++    def get(self, key: str, default=None) -> Dict[str, bytes]:
++        data_index = self.mapping.get(key, None)
++        if data_index is None:
++            return default
++        if isinstance(key, tuple):
++            key = key[0]
++        record = self.datas[data_index].get(key, default=default)
++
++        return record
++
++    def put(self, key: str, value: bytes, *, overwrite: bool = True, append: bool = False, **kwargs) -> int:
++        if append:
++            data_index = len(self.datas) - 1
++        else:
++            data_index = self.mapping.get(key, None)
++            if data_index is None:
++                data_index = len(self.datas) - 1
++        data = self.datas[data_index]
++
++        try:
++            flag = data.put(key, value, overwrite=overwrite, append=False, **kwargs)
++        except lmdb.MapFullError:
++            if not append:
++                raise
++            data_index = self._extend_lmdb()
++            data = self.datas[data_index]
++            flag = data.put(key, value, overwrite=overwrite, append=False, **kwargs)
++
++        if flag == 1:
++            self.mapping[key] = data_index
++            self._buffer.append((key, value))
++
++        return flag
++
++    def pop(self, key: str):
++        data_index = self.mapping.get(key, None)
++        if data_index is None:
++            raise KeyError(f"Pop key not found: {key}")
++        self.datas[data_index].pop(key)
++
++    def commit(self, append: bool = False):
++        for data in self.datas[:-1]:
++            data.commit()
++        try:
++            self.datas[-1].commit()
++        except lmdb.MapFullError:
++            if not append:
++                raise
++            self._extend_lmdb()
++            self.datas[-1].commit()
++        self._buffer.clear()
++
++    def abort(self):
++        for data in self.datas:
++            data.abort()
++        self._buffer.clear()
++
++    def keys(self):
++        return self.mapping.keys()
++
++    @property
++    def readonly(self):
++        return all(data.readonly for data in self.datas)
++
++    def close(self):
++        self.abort()
++        for data in self.datas:
++            data.close()
++
++    def __len__(self):
++        return sum(len(data) for data in self.datas)
++
++    def __del__(self):
++        self.close()
++
++
++LMDBS = ExtendLMDBData
+diff --git a/src/llamafactory/data/qmdb/reader.py b/src/llamafactory/data/qmdb/reader.py
+new file mode 100644
+index 00000000..7b813bbd
+--- /dev/null
++++ b/src/llamafactory/data/qmdb/reader.py
+@@ -0,0 +1,222 @@
++from typing import Optional, List
++import os
++from io import BytesIO
++from base64 import b64decode
++import pickle
++from PIL import Image
++from .tmdb import TMDB, TMDB_EXTS
++from .lmdbs import LMDBS, LMDB_EXTS
++
++try:
++    import decord
++except ImportError:
++    pass
++
++
++def load(path: str, image_dir: Optional[str] = None, task: Optional[str] = None, extra_path: Optional[str] = None):
++    def get_QMDBReader(path):
++        if os.path.isdir(path):
++            exts = {os.path.splitext(file)[1] for file in os.listdir(path)}
++        else:
++            exts = {os.path.splitext(path)[1]}
++
++        if '.tmdb' in exts:
++            return TableQMDBReader
++        elif 'qmdbx' in path or '.qmdbx' in exts:
++            return PickleQMDBReader
++        else:
++            raise ValueError(f"Unrecognized data in path: {path}")
++
++    QMDBReader = get_QMDBReader(path)
++    return QMDBReader.load(path, image_dir, task, extra_path)
++
++
++class BaseQMDBReader:
++    DB = None
++    exts: set = None
++    keys: List = None
++
++    def __init__(self, data, image_dir: Optional[str] = None, task: Optional[str] = None, extra_data=None):
++        self.data = data
++        self.path = data.path
++        self.image_dir = image_dir
++        self.task = task
++        self.extra_data = extra_data
++
++    @classmethod
++    def load(cls, path: str,
++             image_dir: Optional[str] = None, task: Optional[str] = None, extra_path: Optional[str] = None, *,
++             map_size: int = 4*1024*1024*1024, subdir: Optional[bool] = None, readonly: bool = True,
++             max_readers: int = 8192, max_spare_txns: int = 64, lock: bool = False,
++             **kwargs):
++        data = cls.DB.open(path,
++                           map_size=map_size, subdir=subdir, readonly=readonly,
++                           max_readers=max_readers, max_spare_txns=max_spare_txns, lock=lock,
++                           exts=cls.exts, **kwargs)
++
++        if extra_path is None:
++            extra_data = None
++        else:
++            extra_data = LMDBS.open(extra_path,
++                                    map_size=map_size, subdir=subdir, readonly=readonly, max_readers=max_readers,
++                                    max_spare_txns=max_spare_txns, lock=lock, **kwargs)
++
++        return cls(data, image_dir, task, extra_data=extra_data)
++
++    def get(self, key, default=None):
++        record = self.read_data(key)
++        record = self.process(record)
++
++        if record is None:
++            return default
++        else:
++            return record
++
++    def __getitem__(self, index):
++        return self.get(self.keys[index])
++
++    def iter(self, keys: bool = True, values: bool = True, reverse: bool = False):
++        for item in self.data.iter(keys, values, reverse):
++            if keys and values:
++                key, value = item
++            elif keys:
++                key, value = item, None
++            elif values:
++                key, value = None, item
++            else:
++                key, value = None, None
++
++            if value is not None:
++                value = self.process(value)
++
++            if keys and values:
++                yield key, value
++            elif keys:
++                yield key
++            else:
++                yield value
++
++    def process(self, record):
++        if record is None:
++            return record
++
++        if 'images' in record:
++            record['images'] = [self.read_img(image) for image in record['images']]
++        elif 'image' in record:
++            record['images'] = [self.read_img(record.pop('image'))]
++        elif 'video' in record:
++            record['video'] = self.read_video(record['video'])
++
++        return record
++
++    def read_data(self, key):
++        return self.data.get(key)
++
++    def read_img(self, image):
++        if isinstance(image, str):
++            if image.startswith('extra_key: '):
++                image = image[len('extra_key: '):]
++                image = {'image': Image.open(BytesIO(self.extra_data.get(image))).convert('RGB')}
++            elif image.startswith('base64: '):
++                image = image[len('base64: '):]
++                image = {'image': Image.open(BytesIO(b64decode(image))).convert('RGB')}
++            else:
++                image_path = self._parse_image_path(self.image_dir, image)
++                image = {'image': Image.open(image_path).convert('RGB'),
++                         'path': image_path}
++        elif isinstance(image, bytes):
++            image = {'image': Image.open(BytesIO(image)).convert('RGB')}
++        elif isinstance(image, dict):
++            if 'image_b64' in image:
++                image['image'] = Image.open(BytesIO(b64decode(image.pop('image_b64')))).convert('RGB')
++            elif 'image_bytes' in image:
++                image['image'] = Image.open(BytesIO(image.pop('image_bytes'))).convert('RGB')
++            elif 'extra_key' in image:
++                image['image'] = Image.open(BytesIO(self.extra_data.get(image.pop('extra_key')))).convert('RGB')
++            elif 'path' in image:
++                image_path = self._parse_image_path(self.image_dir, image['path'])
++                image['image'] = Image.open(image_path).convert('RGB')
++                image['path'] = image_path
++            else:
++                raise ValueError(f"Cannot find image_b64|image_bytes|extra_key|path in image info keys: {image.keys()}")
++        else:
++            raise ValueError(f"Wrong image type: required str|bytes|dict but got {type(image)}")
++
++        return image
++
++    def read_video(self, video):
++        if isinstance(video, str):
++            video_path = self._parse_image_path(self.image_dir, video)
++            if video_path.endswith('.gif'):
++                video = {'gif': Image.open(video_path), 'path': video_path}
++            elif os.path.isdir(video_path):
++                image_exts = {'.jpg', '.jpeg', '.png'}
++                images = [os.path.join(video_path, f) for f in os.listdir(video_path)
++                          if os.path.splitext(f)[1] in image_exts]
++                video = {'images': images, 'path': video_path}
++            else:
++                video = {'video': decord.VideoReader(video_path, ctx=decord.cpu(0), num_threads=1),
++                         'path': video_path}
++        else:
++            raise ValueError(f"Wrong video type: required str but got {type(video)}")
++
++        return video
++
++    @staticmethod
++    def _parse_image_path(image_dir, image_file):
++        if image_dir is None or image_file.startswith('/'):
++            image_path = image_file
++        else:
++            image_dir = image_dir.rstrip('/')
++
++            if os.path.basename(image_dir) == image_file.split('/')[0]:
++                image_file = '/'.join(image_file.split('/')[1:])
++
++            image_path = os.path.join(image_dir, image_file)
++
++        return image_path
++
++    def __len__(self):
++        return len(self.keys)
++
++    def close(self):
++        self.data.close()
++        if self.extra_data is not None:
++            self.extra_data.close()
++
++    def __del__(self):
++        self.close()
++
++
++class TableQMDBReader(BaseQMDBReader):
++    DB = TMDB
++    exts = TMDB_EXTS
++
++    def __init__(self, *args, **kwargs):
++        super().__init__(*args, **kwargs)
++
++        self.keys = list(self.data.keys())
++
++
++class PickleQMDBReader(BaseQMDBReader):
++    DB = LMDBS
++    exts = LMDB_EXTS | {'.qmdbx'}
++
++    def __init__(self, *args, **kwargs):
++        super().__init__(*args, **kwargs)
++
++        not_extras = [False if '.extra.' in os.path.basename(path) else True for path in self.data.env.paths]
++        self.keys = [k for k, i in self.data.txn.map.items() if not_extras[i]]
++
++    def read_data(self, key):
++        record = self.data.get(key)
++        if record is None:
++            return record
++        record = RestrictedUnpickler(BytesIO(record)).load()
++
++        return record
++
++
++class RestrictedUnpickler(pickle.Unpickler):
++    def find_class(self, module, name):
++        raise pickle.UnpicklingError(f"Attempting to unpickle unknown class: {module}.{name}")
+diff --git a/src/llamafactory/data/qmdb/tmdb.py b/src/llamafactory/data/qmdb/tmdb.py
+new file mode 100644
+index 00000000..80ac0870
+--- /dev/null
++++ b/src/llamafactory/data/qmdb/tmdb.py
+@@ -0,0 +1,686 @@
++import pickle
++from typing import Optional, Dict, List, Set, Any
++import os
++import time
++from io import BytesIO
++from collections import OrderedDict
++import struct
++import glob
++import lmdb
++
++
++TMDB_EXTS = {'.tmdb'}
++
++
++DType_bytes = 0
++DType_bool = 1
++DType_int = 2
++DType_float = 3
++DType_str = 4
++DType_pickle = 5
++
++
++DTypeMapping = {
++    bytes: DType_bytes,
++    bool: DType_bool,
++    int: DType_int,
++    float: DType_float,
++    str: DType_str,
++    list: DType_pickle,
++    dict: DType_pickle,
++    tuple: DType_pickle
++}
++
++DTypes = set(DTypeMapping.values())
++
++
++class DataCoding:
++    Int_Length = 8
++    Float_Length = 'f'
++
++    class IndexCoding:
++        @staticmethod
++        def encode(data: int, length) -> bytes:
++            return data.to_bytes(length, 'little')
++
++        @staticmethod
++        def decode(data: bytes) -> int:
++            return int.from_bytes(data, 'little')
++
++    class TimeCoding:
++        @staticmethod
++        def encode(data: int) -> bytes:
++            return data.to_bytes(4, 'little')
++
++        @staticmethod
++        def decode(data: Optional[bytes]) -> int:
++            return None if data is None else int.from_bytes(data, 'little')
++
++    class BytesCoding:
++        @staticmethod
++        def encode(data: bytes) -> bytes:
++            return data
++
++        @staticmethod
++        def decode(data: bytes) -> bytes:
++            return data
++
++    class BoolCoding:
++        @staticmethod
++        def encode(data: bool) -> bytes:
++            return bytes(data)
++
++        @staticmethod
++        def decode(data: bytes) -> bool:
++            return bool(data)
++
++    class IntCoding:
++        @staticmethod
++        def encode(data: int, length=None, signed=True) -> bytes:
++            if length is None:
++                length = DataCoding.Int_Length
++            return data.to_bytes(length, 'little', signed=signed)
++
++        @staticmethod
++        def decode(data: bytes, signed=True) -> int:
++            return int.from_bytes(data, 'little', signed=signed)
++
++    class FloatCoding:
++        @staticmethod
++        def encode(data: float, length=None) -> bytes:
++            if length is None:
++                length = DataCoding.Float_Length
++            return struct.pack(length, data)
++
++        @staticmethod
++        def decode(data: bytes, length=None) -> float:
++            if length is None:
++                length = DataCoding.Float_Length
++            return struct.unpack(length, data)[0]
++
++    class StrCoding:
++        @staticmethod
++        def encode(data: str) -> bytes:
++            return data.encode()
++
++        @staticmethod
++        def decode(data: bytes) -> str:
++            return data.decode()
++
++    class PickleCoding:
++        @staticmethod
++        def encode(data: Any) -> bytes:
++            return pickle.dumps(data, protocol=4)
++
++        @staticmethod
++        def decode(data: bytes) -> Any:
++            return DataCoding.RestrictedUnpickler(BytesIO(data)).load()
++
++    class RestrictedUnpickler(pickle.Unpickler):
++        def find_class(self, module, name):
++            raise pickle.UnpicklingError(f"Attempting to unpickle unknown class: {module}.{name}")
++
++    EncodeBook = {
++        DType_bytes: BytesCoding.encode,
++        DType_bool: BoolCoding.encode,
++        DType_int: IntCoding.encode,
++        DType_float: FloatCoding.encode,
++        DType_str: StrCoding.encode,
++        DType_pickle: PickleCoding.encode
++    }
++
++    DecodeBook = {
++        DType_bytes: BytesCoding.decode,
++        DType_bool: BoolCoding.decode,
++        DType_int: IntCoding.decode,
++        DType_float: FloatCoding.decode,
++        DType_str: StrCoding.decode,
++        DType_pickle: PickleCoding.decode
++    }
++
++    @staticmethod
++    def encode(data: Any, dtype: int, **kwargs) -> bytes:
++        encode_fn = DataCoding.EncodeBook[dtype]
++        return encode_fn(data, **kwargs)
++
++    @staticmethod
++    def decode(data: bytes, dtype: int, **kwargs) -> Any:
++        decode_fn = DataCoding.DecodeBook[dtype]
++        return decode_fn(data, **kwargs)
++
++
++def alphanum_path_key(s: str):
++    """Use to sort string by numbers in it, useful when numbers in string are not matched in digit (1 and 001)."""
++    s = os.path.splitext(s)[0]
++    sections = []
++    section = ''
++    is_digit = False
++    for c in s:
++        if c.isdigit() == is_digit:
++            section += c
++        else:
++            if is_digit:
++                section = int(section)
++            sections.append(section)
++            section, is_digit = c, c.isdigit()
++    if is_digit:
++        section = int(section)
++    sections.append(section)
++    return sections
++
++
++class Column:
++    dtype_index = 0
++
++    def __init__(self, db, dtype):
++        if dtype not in DTypes:
++            raise ValueError(f"Unknown column dtype: {dtype}")
++        self.db = db
++        self.dtype = dtype
++
++    @classmethod
++    def new(cls, env: lmdb.Environment, column_name: str, dtype: int, txn: lmdb.Transaction):
++        db = env.open_db(column_name.encode(), txn=txn, reverse_key=True, integerkey=True, create=True)
++
++        if dtype not in DTypes:
++            raise ValueError(f"Unknown column dtype: {dtype}")
++        dtype_index = DataCoding.IndexCoding.encode(Column.dtype_index, LMDBTable.Index_Length)
++        flag = txn.put(dtype_index, DataCoding.IntCoding.encode(dtype, length=1), db=db)
++        if not flag:
++            raise RuntimeError("Failed to put dtype when creating column.")
++
++        return Column(db, dtype)
++
++    @classmethod
++    def open(cls, env: lmdb.Environment, column_name: str):
++        db = env.open_db(column_name.encode(), reverse_key=True, integerkey=True, create=False)
++
++        dtype_index = DataCoding.IndexCoding.encode(Column.dtype_index, LMDBTable.Index_Length)
++        with env.begin(write=False) as txn:
++            dtype = txn.get(dtype_index, None, db=db)
++        if dtype is None:
++            raise ValueError("Column dtype is not defined.")
++        dtype = DataCoding.IntCoding.decode(dtype)
++
++        return cls(db, dtype)
++
++
++class LMDBTable:
++    Index_key = b'.Index'
++    Map_key = b'.Map'
++    CreateTime_key = b'.CreateTime'
++    UpdateTime_key = b'.UpdateTime'
++    Index_Length = 4
++
++    def __init__(self, path: str, env: lmdb.Environment):
++        self.path = path
++        self.env = env
++
++        self._init_table()
++
++        self.columns = OrderedDict((c, Column.open(env, c)) for c in self.column_names)
++
++        self._keys_file = self.path + '-keys'
++        self.keys = self._init_keys()
++        self._keys_buffer = []
++        self._has_pop_keys = False
++
++        self._txn = None
++        if self.readonly:
++            self._txn = self.txn
++
++    def _init_table(self):
++        if self.env.stat()['entries'] == 0:
++            with self.env.begin(write=True) as txn:
++                self.Index = self.env.open_db(self.Index_key, txn, reverse_key=True, integerkey=True)
++                self.Map = self.env.open_db(self.Map_key, txn)
++                self.CreateTime = self.env.open_db(self.CreateTime_key, txn, reverse_key=True, integerkey=True)
++                self.UpdateTime = self.env.open_db(self.UpdateTime_key, txn, reverse_key=True, integerkey=True)
++        else:
++            self.Index = self.env.open_db(self.Index_key, reverse_key=True, integerkey=True, create=False)
++            self.Map = self.env.open_db(self.Map_key, create=False)
++            self.CreateTime = self.env.open_db(self.CreateTime_key, reverse_key=True, integerkey=True, create=False)
++            self.UpdateTime = self.env.open_db(self.UpdateTime_key, reverse_key=True, integerkey=True, create=False)
++
++    @property
++    def txn(self):
++        if self._txn is None:
++            self._txn = self.env.begin(write=not self.readonly)
++        return self._txn
++
++    @staticmethod
++    def open(path: str, map_size: int = 4*1024*1024*1024,
++             subdir: Optional[bool] = None, readonly: bool = True, *args, max_dbs=128, **kwargs):
++        subdir = bool(subdir)
++        assert subdir is False, "'subdir' must be None or False."
++
++        env = lmdb.Environment(path, map_size, subdir, readonly, *args, max_dbs=max_dbs, **kwargs)
++
++        return LMDBTable(path, env)
++
++    def _init_keys(self):
++        if os.path.exists(self._keys_file):
++            with open(self._keys_file) as f:
++                keys = f.read().splitlines()
++        else:
++            keys = None
++
++        txn = self.env.begin(self.Map, write=False)
++        if keys is None or len(keys) != txn.stat()['entries']:
++            keys = []
++            for key, idx in txn.cursor().iternext():
++                keys.append((DataCoding.IndexCoding.decode(idx), key.decode()))
++            txn.abort()
++            keys = sorted(keys, key=lambda ik: ik[0])
++            keys = [ik[1] for ik in keys]
++            with open(self._keys_file, 'w') as f:
++                f.writelines(k + '\n' for k in keys)
++        else:
++            txn.abort()
++
++        keys = OrderedDict((k, None) for k in keys)
++
++        return keys
++
++    def get(self, key: str, column_names=None, default=None, get_meta=False):
++        index = self.txn.get(key.encode(), db=self.Map)
++        if index is None:
++            return default
++        if column_names is None:
++            column_names = self.columns.keys()
++
++        record = {}
++        for c in column_names:
++            item = self._get_item(index, c)
++            if item is not None:
++                record[c] = item
++
++        if get_meta:
++            record['.CreateTime'] = DataCoding.TimeCoding.decode(self.txn.get(index, db=self.CreateTime))
++            record['.UpdateTime'] = DataCoding.TimeCoding.decode(self.txn.get(index, db=self.UpdateTime))
++
++        return record
++
++    def _get_item(self, index, column_name):
++        column = self.columns[column_name]
++        item = self.txn.get(index, db=column.db)
++        if item is None:
++            return None
++        item = DataCoding.decode(item, column.dtype)
++
++        return item
++
++    def put(self, key: str, value: dict, overwrite=True, append=False, new_column=False):
++        if key in self.keys:
++            if not overwrite:
++                raise KeyError(f"Key already exists when not overwrite: {key}")
++            if append:
++                raise KeyError(f"Key already exists when append: {key}")
++            index = self.txn.get(key.encode(), db=self.Map)
++            flag = 2
++        else:
++            index = self.new_index
++            flag = 1
++
++        self._put_check(value, new_column)
++
++        for column_name, item in value.items():
++            self._put_item(index, item, column_name, overwrite, append)
++
++        timestamp = int(time.time())
++        if flag == 1:
++            self.keys[key] = None
++            self._keys_buffer.append(key)
++            key_bytes = key.encode()
++            flag_ = self.txn.put(key_bytes, index, db=self.Map, overwrite=False)
++            if not flag_:
++                raise RuntimeError("Conflict in putting a new key: exists in Map.")
++            self.txn.put(index, key_bytes, db=self.Index, append=True)
++            self.txn.put(index, DataCoding.TimeCoding.encode(timestamp), db=self.CreateTime, append=True)
++            self.txn.put(index, DataCoding.TimeCoding.encode(timestamp), db=self.UpdateTime, append=True)
++        else:
++            self.txn.put(index, DataCoding.TimeCoding.encode(timestamp), db=self.UpdateTime, overwrite=overwrite)
++
++        return flag
++
++    def _put_check(self, value: dict, new_column=False):
++        for column_name, item in value.items():
++            if item is None:
++                continue
++
++            dtype = DTypeMapping.get(type(item), None)
++            if dtype is None:
++                raise ValueError(f"Unsupported item type: {type(item)}, in column: {column_name}")
++
++            column = self.columns.get(column_name, None)
++            if column is None:
++                if not new_column:
++                    raise ValueError(f"Column does not exist when new_column=False: {column_name}")
++            else:
++                if dtype != column.dtype:
++                    raise ValueError(f"Item type {dtype} does not match column type {column.dtype} "
++                                     f"in column: {column_name}")
++
++    def _put_item(self, index, item, column_name, overwrite=True, append=False):
++        if item is None:
++            return
++
++        dtype = DTypeMapping[type(item)]
++
++        if column_name in self.columns:
++            column = self.columns[column_name]
++        else:
++            column = Column.new(self.env, column_name, dtype, self.txn)
++            self.columns[column_name] = column
++
++        item = DataCoding.encode(item, column.dtype)
++
++        flag = self.txn.put(index, item, db=column.db, overwrite=overwrite, append=append)
++        if not flag:
++            raise RuntimeError(f"Failed to put item in column: {column_name}")
++
++    def pop(self, key: str, column_names=None):
++        index = self.txn.get(key.encode(), db=self.Map)
++        if index is None:
++            return None
++        if column_names is None:
++            column_names = self.columns.keys()
++        for c in column_names:
++            self._pop_item(index, c)
++        self.keys.pop(key)
++        self._has_pop_keys = True
++        self.txn.pop(index, db=self.Index)
++        self.txn.pop(key.encode(), db=self.Map)
++
++    def _pop_item(self, index, column_name):
++        column = self.columns[column_name]
++        self.txn.pop(index, db=column.db)
++
++    def drop_column(self, column_name):
++        column = self.columns.pop(column_name, None)
++        if column is None:
++            return
++        self.txn.drop(column.db, delete=True)
++
++    def iter(self, keys: bool = True, values: bool = True, reverse: bool = False):
++        assert keys or values, "keys and values cannot both be False."
++
++        if reverse:
++            iterator = self.txn.cursor(db=self.Index).iterprev(keys=False)
++        else:
++            iterator = self.txn.cursor(db=self.Index).iternext(keys=False)
++
++        for key in iterator:
++            key = key.decode()
++            if values:
++                value = self.get(key)
++
++            if keys and values:
++                yield key, value
++            elif keys:
++                yield key
++            else:
++                yield value
++
++    def commit(self):
++        if self._txn is not None:
++            self._txn.commit()
++            self._txn = None
++
++        if self._has_pop_keys:
++            with open(self._keys_file, 'w') as f:
++                f.writelines(k + '\n' for k in self.keys)
++        else:
++            with open(self._keys_file, 'a') as f:
++                f.writelines(k + '\n' for k in self._keys_buffer)
++
++        self.abort()
++
++    def abort(self):
++        if self._txn is not None:
++            self._txn.abort()
++            self._txn = None
++        self._keys_buffer.clear()
++        self._has_pop_keys = False
++
++    @property
++    def readonly(self):
++        return self.env.flags()['readonly']
++
++    @property
++    def column_names(self):
++        column_names = []
++        with self.env.begin(write=False) as txn:
++            for key in txn.cursor().iternext(values=False):
++                if not key.startswith(b'.'):
++                    column_names.append(key.decode())
++
++        return column_names
++
++    @property
++    def last_index(self):
++        with self.txn.cursor(self.Index) as curs:
++            last_index = DataCoding.IndexCoding.decode(curs.key()) if curs.last() else 63
++
++        return last_index
++
++    @property
++    def new_index(self):
++        return DataCoding.IndexCoding.encode(self.last_index + 1, LMDBTable.Index_Length)
++
++    def close(self):
++        self.abort()
++        self.columns.clear()
++        self.env.close()
++
++    def __len__(self):
++        with self.env.begin(self.Map, write=False) as txn:
++            entries = txn.stat()['entries']
++
++        return entries
++
++    def __del__(self):
++        self.close()
++
++
++class ExtendLMDBTable:
++    def __init__(self, path: str, tables: List[LMDBTable], map_size: int):
++        self.path = path
++        self.tables = tables
++        self.map_size = map_size
++        self._buffer = []
++
++        self.mapping = self._init_mapping()
++
++    @classmethod
++    def open(cls, path: str, map_size: int = 4*1024*1024*1024, subdir: Optional[bool] = None, readonly: bool = True,
++             *args, exts: Optional[Set[str]] = None, **kwargs):
++        paths = cls._parse_path(path, exts)
++        tables = [LMDBTable.open(p, map_size, subdir, readonly, *args, **kwargs) for p in paths]
++
++        return cls(path, tables, map_size)
++
++    @classmethod
++    def dump(cls, data: Dict[str, Dict[str, Any]], path: str, map_size: int = 4*1024*1024*1024,
++             subdir: Optional[bool] = None, readonly: bool = False, *args, commit_size=256, **kwargs):
++        assert isinstance(data, dict), f"dump data must be a dictionary, rather than a {type(data)}."
++        for value in data.values():
++            assert isinstance(value, dict), f"value in data must be a dictionary, rather than a {type(value)}."
++
++        tmdb = cls.open(path, map_size, subdir, readonly, *args, **kwargs)
++
++        commit_size_ = commit_size - 1
++        for i, (key, value) in enumerate(data.items()):
++            tmdb.put(key, value, append=True, new_column=True)
++            if i % commit_size == commit_size_:
++                tmdb.commit(append=True)
++        tmdb.commit(append=True)
++        tmdb.abort()
++
++    @classmethod
++    def _parse_path(cls, path: str, exts: Optional[Set[str]] = None):
++        if exts is None:
++            exts = TMDB_EXTS
++
++        if isinstance(path, list):
++            paths = path
++        elif glob.has_magic(path):
++            paths = sorted(glob.glob(path), key=alphanum_path_key)
++        elif not os.path.exists(path):
++            paths = [cls._create_path(path)]
++        elif os.path.isdir(path):
++            paths = sorted(glob.glob(os.path.join(path, '*')), key=alphanum_path_key)
++            paths = [p for p in paths if os.path.splitext(p)[1] in exts]
++        else:
++            paths = [path]
++
++        if not len(paths):
++            raise FileNotFoundError(f"Cannot find tmdb files in path: {path}.")
++
++        return paths
++
++    @staticmethod
++    def _create_path(path: str):
++        ext = os.path.splitext(path)[1]
++        if ext == '':
++            folder = path
++            file = os.path.join(path, 'data.tmdb')
++        else:
++            folder = os.path.dirname(path)
++            file = path
++
++        if not os.path.exists(folder):
++            os.mkdir(folder)
++
++        return file
++
++    def _init_mapping(self):
++        mapping = {}
++        _counts = {}
++        for i, table in enumerate(self.tables):
++            for k in table.keys:
++                n = _counts.get(k, 0)
++                _counts[k] = n + 1
++                k = (k, n) if n else k
++                mapping[k] = i
++
++        return mapping
++
++    def _extend_table(self):
++        assert not self.readonly, "Failed to extend_table, cannot extend in readonly mode."
++        assert len(self.tables) > 0, "Failed to extend_table, no existing table."
++        path = self.path if os.path.isfile(self.path) else self.tables[0].path
++        index = len(self.tables)
++
++        _buffer = self._buffer.copy()
++        self.abort()
++
++        dn, fn = os.path.split(path)
++        fn, ext = os.path.splitext(fn)
++        path = f"{dn}/{fn}-{index}{ext}"
++
++        table = LMDBTable.open(path, map_size=self.map_size, subdir=False, readonly=False)
++        self.tables.append(table)
++
++        for key, value in _buffer:
++            self.put(key, value, append=True, new_column=True)
++
++        return index
++
++    def get(self, key: str, column_names: Optional[List[str]] = None, default: Any = None, get_meta: bool = False) \
++            -> Dict[str, Any]:
++        table_index = self.mapping.get(key, None)
++        if table_index is None:
++            return default
++        if isinstance(key, tuple):
++            key = key[0]
++        record = self.tables[table_index].get(key, column_names=column_names, default=default, get_meta=get_meta)
++
++        return record
++
++    def put(self, key: str, value: Dict[str, Any],
++            overwrite: bool = True, append: bool = False, new_column: bool = False) -> int:
++        if append:
++            table_index = len(self.tables) - 1
++        else:
++            table_index = self.mapping.get(key, None)
++            if table_index is None:
++                table_index = len(self.tables) - 1
++        table = self.tables[table_index]
++
++        try:
++            flag = table.put(key, value, overwrite=overwrite, append=append, new_column=new_column)
++        except lmdb.MapFullError:
++            if not append:
++                raise
++            table_index = self._extend_table()
++            table = self.tables[table_index]
++            flag = table.put(key, value, overwrite=overwrite, append=append, new_column=new_column)
++
++        if flag == 1:
++            self.mapping[key] = table_index
++            self._buffer.append((key, value))
++
++        return flag
++
++    def pop(self, key: str, column_names: Optional[List[str]] = None):
++        table_index = self.mapping.get(key, None)
++        if table_index is None:
++            raise KeyError(f"Pop key not found: {key}")
++        self.tables[table_index].pop(key, column_names=column_names)
++
++    def drop_column(self, column_name: Optional[List[str]]):
++        for table in self.tables:
++            table.drop_column(column_name)
++
++    def iter(self, keys: bool = True, values: bool = True, reverse: bool = False):
++        if reverse:
++            tables = self.tables[::-1]
++        else:
++            tables = self.tables
++
++        for table in tables:
++            for item in table.iter(keys, values, reverse):
++                yield item
++
++    def commit(self, append: bool = False):
++        for table in self.tables[:-1]:
++            table.commit()
++        try:
++            self.tables[-1].commit()
++        except lmdb.MapFullError:
++            if not append:
++                raise
++            self._extend_table()
++            self.tables[-1].commit()
++        self._buffer.clear()
++
++    def abort(self):
++        for table in self.tables:
++            table.abort()
++        self._buffer.clear()
++
++    def keys(self):
++        return self.mapping.keys()
++
++    @property
++    def readonly(self):
++        return all(table.readonly for table in self.tables)
++
++    @property
++    def column_names(self):
++        return list(set.union(*(set(table.columns.keys()) for table in self.tables)))
++
++    def close(self):
++        self.abort()
++        for table in self.tables:
++            table.close()
++
++    def __len__(self):
++        return sum(len(table) for table in self.tables)
++
++    def __del__(self):
++        self.close()
++
++
++TMDB = ExtendLMDBTable
+diff --git a/src/llamafactory/hparams/data_args.py b/src/llamafactory/hparams/data_args.py
+index 9267657c..a2655105 100644
+--- a/src/llamafactory/hparams/data_args.py
++++ b/src/llamafactory/hparams/data_args.py
+@@ -125,10 +125,6 @@ class DataArguments:
+         default=True,
+         metadata={"help": "Whether or not to enable thinking mode for reasoning models."},
+     )
+-    preserve_thinking: bool = field(
+-        default=False,
+-        metadata={"help": "Whether or not to preserve thinking content in historical turns for reasoning models."},
+-    )
+     tokenized_path: str | None = field(
+         default=None,
+         metadata={
+@@ -143,6 +139,187 @@ class DataArguments:
+         default=False,
+         metadata={"help": "Whether or not to use a shared file system for the datasets."},
+     )
++    # ODB (Online Dynamic Batch) - works for both standard HuggingFace Dataset and QMDB lazy loading
++    use_odb: bool = field(
++        default=False,
++        metadata={
++            "help": (
++                "Enable Online Dynamic Batch (ODB). "
++                "Dynamically adjusts batch size based on sequence length. "
++                "Works for both standard datasets and QMDB lazy loading."
++            )
++        },
++    )
++    odb_max_input_length: int = field(
++        default=8192,
++        metadata={
++            "help": (
++                "Maximum input length for ODB dynamic batch calculation. "
++                "batch_size = odb_max_input_length / actual_length."
++            )
++        },
++    )
++    odb_version: int = field(
++        default=1,
++        metadata={
++            "help": (
++                "ODB implementation version. "
++                "0 = QQMM original faithful replica (odb0.py), "
++                "1 = original (odb.py), 11 = v1 with shutdown fixes (odb1_1.py), "
++                "2 = bug-fixed with overflow recycle (odb2.py), "
++                "3 = v2 + join_mode support (odb3.py), "
++                "4 = v3 + exact total_batch_size via dual all_gather (odb4.py), "
++                "5 = single all_gather with local grouping, no warm-up (odb5.py, fastest)."
++                "6 = non-blocking drain, no buffer wait (odb6.py)."
++                "7 = accumulate drain + interleaved output (odb7.py)."
++                "8 = local grouping, no cross-rank comm in collate (odb8.py)."
++            )
++        },
++    )
++    odb_join_mode: bool = field(
++        default=False,
++        metadata={
++            "help": (
++                "Enable join mode for ODB v3/v4. When True, a finished rank will "
++                "StopIteration independently while other ranks continue producing "
++                "batches. Designed for use with DDP Join. Only effective when odb_version>=3."
++            )
++        },
++    )
++    odb_loss_scaling_mode: str = field(
++        default="sample",
++        metadata={
++            "help": (
++                "ODB DDP loss-scaling strategy. One of: "
++                "'sample' (1 all_gather; loss scaled by local_bs / total_bs * world_size), "
++                "'token_approx' (1 all_gather, token counts piggybacked; loss scaled by "
++                "local_tokens / total_tokens * world_size with avg-length approximation when "
++                "alignment changes group sizes), "
++                "'token_exact' (2 all_gathers; second gather syncs post-alignment token counts). "
++                "Only effective when use_odb=True and odb_version=51."
++            )
++        },
++    )
++    # --- Legacy fields kept for backward compatibility -------------------
++    # Old yaml configs used these two booleans; they are mapped onto
++    # ``odb_loss_scaling_mode`` in ``__post_init__``.  New configs should
++    # set ``odb_loss_scaling_mode`` directly and leave these unset.
++    odb_loss_scaling: bool | None = field(
++        default=None,
++        metadata={
++            "help": (
++                "DEPRECATED. Use odb_loss_scaling_mode instead. "
++                "If set, False maps to 'sample', True maps to 'token_approx' or 'token_exact' "
++                "depending on odb_loss_scaling_approx."
++            )
++        },
++    )
++    odb_loss_scaling_approx: bool | None = field(
++        default=None,
++        metadata={"help": "DEPRECATED. Use odb_loss_scaling_mode instead."},
++    )
++    odb_no_warmup: bool = field(
++        default=False,
++        metadata={
++            "help": (
++                "Ablation flag: skip buffer warm-up ramp (start at full buffer requirement). "
++                "Only effective when use_odb=True and odb_version=51."
++            )
++        },
++    )
++    odb_buffer_size: int | None = field(
++        default=None,
++        metadata={
++            "help": (
++                "Override the auto-calculated ODB buffer size (number of samples to collect before grouping). "
++                "Default is prefetch_factor*0.9*num_workers (~920). Only effective when use_odb=True and odb_version=51."
++            )
++        },
++    )
++    odb_no_sync: bool = field(
++        default=False,
++        metadata={
++            "help": (
++                "Ablation flag: disable DDP cross-rank synchronization (each rank groups independently). "
++                "Only effective when use_odb=True and odb_version=51."
++            )
++        },
++    )
++    odb_max_patches: int = field(
++        default=0,
++        metadata={
++            "help": (
++                "Maximum total ViT patches per batch. Prevents OOM on image-heavy batches by capping "
++                "the batch size based on vision compute cost. 0 disables the constraint. "
++                "Only effective when use_odb=True and odb_version=51."
++            )
++        },
++    )
++    # Sorted Batching - sort samples by length to reduce padding waste
++    use_sorted_batching: bool = field(
++        default=False,
++        metadata={
++            "help": (
++                "Enable sorted batching. Sorts samples by sequence length so that "
++                "samples within each batch have similar lengths, reducing padding waste. "
++                "Uses character length as a proxy for token length. "
++                "Compatible with TMDB lazy loading and multimodal data."
++            )
++        },
++    )
++    use_hf_group_by_length: bool = field(
++        default=False,
++        metadata={
++            "help": (
++                "Enable HuggingFace LengthGroupedSampler / DistributedLengthGroupedSampler. "
++                "This is a randomized length-grouped fixed-batch baseline. If "
++                "max_tokens_oracle_cache is provided, it uses exact post-tokenization "
++                "lengths; otherwise it falls back to the character-count proxy."
++            )
++        },
++    )
++
++    # Token-budget batching baselines (GMT/BMT)
++    use_global_max_tokens: bool = field(
++        default=False,
++        metadata={
++            "help": (
++                "Enable GlobalMaxTokens batching (fairseq-style token-budget packing). "
++                "Mutually exclusive with use_odb and use_sorted_batching."
++            )
++        },
++    )
++    use_bucketed_max_tokens: bool = field(
++        default=False,
++        metadata={
++            "help": (
++                "Enable BucketedMaxTokens batching (token-budget with bucketing to reduce curriculum drift). "
++                "Mutually exclusive with use_odb, use_sorted_batching, and use_global_max_tokens."
++            )
++        },
++    )
++    max_tokens_budget: int = field(
++        default=8192,
++        metadata={
++            "help": "Per-rank token budget for GlobalMaxTokens/BucketedMaxTokens batching."
++        },
++    )
++    max_tokens_bucket_size: int = field(
++        default=4096,
++        metadata={
++            "help": "Mega-bucket size for BucketedMaxTokens (number of samples per bucket before sorting and packing)."
++        },
++    )
++    max_tokens_oracle_cache: str | None = field(
++        default=None,
++        metadata={
++            "help": (
++                "Path to precomputed oracle length cache JSON. If provided, "
++                "GlobalMaxTokens/BucketedMaxTokens will use exact post-tokenization token counts. "
++                "If None, uses character-count proxy (same as sorted batching)."
++            )
++        },
++    )
+ 
+     def __post_init__(self):
+         def split_arg(arg):
+@@ -188,5 +365,48 @@ class DataArguments:
+         if self.packing:
+             self.cutoff_len -= 1  # avoid pad_to_multiple_of, needs improve
+ 
++        # Resolve legacy odb_loss_scaling / odb_loss_scaling_approx onto the
++        # unified odb_loss_scaling_mode.  Legacy fields are honoured only when
++        # set explicitly (i.e. not None).
++        if self.odb_loss_scaling is not None or self.odb_loss_scaling_approx is not None:
++            legacy_on = bool(self.odb_loss_scaling)
++            legacy_approx = True if self.odb_loss_scaling_approx is None else bool(self.odb_loss_scaling_approx)
++            if not legacy_on:
++                resolved = "sample"
++            elif legacy_approx:
++                resolved = "token_approx"
++            else:
++                resolved = "token_exact"
++            self.odb_loss_scaling_mode = resolved
++
++        valid_modes = {"sample", "token_approx", "token_exact"}
++        if self.odb_loss_scaling_mode not in valid_modes:
++            raise ValueError(
++                f"odb_loss_scaling_mode must be one of {sorted(valid_modes)}, "
++                f"got {self.odb_loss_scaling_mode!r}."
++            )
++
++        # Validate mutual exclusion for GMT/BMT token-budget samplers
++        gmt_bmt = self.use_global_max_tokens or self.use_bucketed_max_tokens
++        if (gmt_bmt or self.use_hf_group_by_length) and self.use_odb:
++            raise ValueError(
++                "use_global_max_tokens, use_bucketed_max_tokens, and use_hf_group_by_length "
++                "are mutually exclusive with use_odb."
++            )
++        if (gmt_bmt or self.use_hf_group_by_length) and self.use_sorted_batching:
++            raise ValueError(
++                "use_global_max_tokens, use_bucketed_max_tokens, and use_hf_group_by_length "
++                "are mutually exclusive with use_sorted_batching."
++            )
++        if self.use_hf_group_by_length and gmt_bmt:
++            raise ValueError(
++                "use_hf_group_by_length is mutually exclusive with use_global_max_tokens and "
++                "use_bucketed_max_tokens."
++            )
++        if self.use_global_max_tokens and self.use_bucketed_max_tokens:
++            raise ValueError(
++                "use_global_max_tokens and use_bucketed_max_tokens cannot both be True."
++            )
++
+     def to_dict(self) -> dict[str, Any]:
+         return asdict(self)
+diff --git a/src/llamafactory/train/sft/trainer.py b/src/llamafactory/train/sft/trainer.py
+index dfed95a5..20feef26 100644
+--- a/src/llamafactory/train/sft/trainer.py
++++ b/src/llamafactory/train/sft/trainer.py
+@@ -17,6 +17,7 @@
+ 
+ import json
+ import os
++import time
+ from functools import partial
+ from types import MethodType
+ from typing import TYPE_CHECKING, Any, Optional, Union
+@@ -24,6 +25,7 @@ from typing import TYPE_CHECKING, Any, Optional, Union
+ import numpy as np
+ import torch
+ from transformers import Seq2SeqTrainer
++from transformers.trainer_callback import TrainerCallback
+ from typing_extensions import override
+ 
+ from ...extras import logging
+@@ -32,6 +34,84 @@ from ..callbacks import SaveProcessorCallback
+ from ..fp8_utils import configure_fp8_environment, patch_accelerator_for_fp8, verify_fp8_status
+ from ..trainer_utils import create_custom_optimizer, create_custom_scheduler
+ 
++# Import ODB callback from standalone package, with built-in fallback
++try:
++    from odb.callbacks import ODBDynamicBatchCallback
++except ImportError:
++    from transformers.trainer_callback import TrainerCallback
++
++    class ODBDynamicBatchCallback(TrainerCallback):  # type: ignore[no-redef]
++        """Fallback: built-in ODB epoch tracking callback when standalone odb package is not installed."""
++
++        def __init__(self, odb_total_samples: int):
++            self._lr_scheduler_last_epoch = -10000
++            self._odb_total_samples = odb_total_samples
++
++        def on_train_begin(self, args, state, control, **kwargs):
++            state.total_data_step = 0
++            state.total_batch_sizes = []
++            state.accumulation_batch_size = 0
++
++        def on_step_end(self, args, state, control, **kwargs):
++            self._update_step(args, state, control)
++            assert len(state.total_batch_sizes) == 0
++            lr_scheduler = kwargs.get("lr_scheduler")
++            if lr_scheduler is not None and self._lr_scheduler_last_epoch < lr_scheduler.last_epoch:
++                for _ in range(state.accumulation_batch_size - 1):
++                    lr_scheduler.step()
++                self._lr_scheduler_last_epoch = lr_scheduler.last_epoch
++            state.accumulation_batch_size = 0
++
++        def on_substep_end(self, args, state, control, **kwargs):
++            self._update_step(args, state, control)
++
++        def _update_step(self, args, state, control):
++            if not state.total_batch_sizes:
++                return
++            total_batch_size = state.total_batch_sizes.pop(0)
++            state.accumulation_batch_size += total_batch_size
++            state.total_data_step += total_batch_size
++            state.epoch = state.total_data_step / self._odb_total_samples * args.num_train_epochs
++            if state.total_data_step >= self._odb_total_samples:
++                control.should_training_stop = True
++
++
++class _ODBProgressCallback(TrainerCallback):
++    """Progress bar that shows sample progress (total_data_step) instead of step progress (global_step).
++
++    In ODB mode, each step processes a variable number of samples, so global_step is not meaningful
++    for progress tracking. This callback shows total_data_step / max_steps instead, where
++    max_steps = N * num_epochs (total samples to process).
++    """
++
++    def __init__(self):
++        self.training_bar = None
++        self._current_data_step = 0
++
++    def on_train_begin(self, args, state, control, **kwargs):
++        if state.is_world_process_zero:
++            from tqdm.auto import tqdm
++
++            self.training_bar = tqdm(total=state.max_steps, dynamic_ncols=True)
++        self._current_data_step = 0
++
++    def on_step_end(self, args, state, control, **kwargs):
++        if state.is_world_process_zero and self.training_bar is not None:
++            data_step = getattr(state, "total_data_step", state.global_step)
++            self.training_bar.update(data_step - self._current_data_step)
++            self._current_data_step = data_step
++
++    def on_log(self, args, state, control, logs=None, **kwargs):
++        if state.is_world_process_zero and self.training_bar is not None and logs:
++            _ = logs.pop("total_flos", None)
++            if logs:
++                self.training_bar.write(str(logs))
++
++    def on_train_end(self, args, state, control, **kwargs):
++        if state.is_world_process_zero and self.training_bar is not None:
++            self.training_bar.close()
++            self.training_bar = None
++
+ 
+ if TYPE_CHECKING:
+     from torch.utils.data import Dataset
+@@ -57,6 +137,45 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
+         **kwargs,
+     ) -> None:
+         kwargs["processing_class"] = kwargs.pop("tokenizer")
++
++        # Pop lazy dataloader related kwargs before passing to parent
++        # These are used for QMDB lazy loading with OLG/ODB dataloaders
++        self._lazy_dataloader = kwargs.pop("_lazy_dataloader", None)
++        self._lazy_collator = kwargs.pop("_lazy_collator", None)
++        self._enable_odb_with_package = kwargs.pop("_enable_odb_with_package", False)
++
++        # Pop ODB configuration for standard HuggingFace Dataset
++        self._use_odb = kwargs.pop("_use_odb", False)
++        self._odb_max_input_length = kwargs.pop("_odb_max_input_length", 8192)
++        self._odb_version = kwargs.pop("_odb_version", 1)
++        self._odb_join_mode = kwargs.pop("_odb_join_mode", False)
++        # ODB DDP loss-scaling strategy: "sample" | "token_approx" | "token_exact".
++        # Backward compat: accept the old two-bool API and translate.
++        legacy_ls = kwargs.pop("_odb_loss_scaling", None)
++        legacy_ls_approx = kwargs.pop("_odb_loss_scaling_approx", None)
++        mode = kwargs.pop("_odb_loss_scaling_mode", None)
++        if mode is None:
++            if not legacy_ls:
++                mode = "sample"
++            elif legacy_ls_approx is False:
++                mode = "token_exact"
++            else:
++                mode = "token_approx"
++        if mode not in {"sample", "token_approx", "token_exact"}:
++            raise ValueError(f"unknown _odb_loss_scaling_mode={mode!r}")
++        self._odb_loss_scaling_mode = mode
++        self._odb_no_warmup = kwargs.pop("_odb_no_warmup", False)
++        self._odb_no_sync = kwargs.pop("_odb_no_sync", False)
++        self._odb_buffer_size = kwargs.pop("_odb_buffer_size", None)
++        self._odb_max_patches = kwargs.pop("_odb_max_patches", 0)
++        self._odb_unscaled_loss_sum = 0.0
++        self._odb_unscaled_loss_count = 0
++
++        # Handle disable_shuffling for lazy dataloader
++        # Need to rebuild dataloader with shuffle=False if disable_shuffling is set
++        if self._lazy_dataloader is not None and finetuning_args.disable_shuffling:
++            self._lazy_dataloader = self._rebuild_lazy_dataloader_without_shuffle(self._lazy_dataloader)
++
+         # Configure FP8 environment if enabled
+         training_args: TrainingArguments = kwargs.get("args")
+         if training_args.fp8:
+@@ -71,6 +190,25 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
+             self.model_accepts_loss_kwargs = False
+ 
+         self.finetuning_args = finetuning_args
++
++        # ODB epoch-tracking callback registration (lazy; in compute_loss).
++        self._odb_epoch_callback_registered = False
++        # Per-step ODB metadata, populated in compute_loss.
++        self._odb_local_bs = 1
++        self._odb_total_bs = None
++        self._odb_local_tokens = None
++        self._odb_total_tokens = None
++
++        # Token throughput tracking (GPU-accumulated to avoid per-step sync)
++        self._token_count_gpu = None  # loss tokens: labels != IGNORE_INDEX (GPU tensor)
++        self._real_token_count_gpu = None  # real tokens: input_ids != pad_token_id (GPU tensor)
++        self._compute_token_count_gpu = None  # compute tokens: input_ids.numel() (GPU tensor)
++        self._total_token_count = 0  # cumulative loss tokens (CPU, synced at log time)
++        self._total_real_token_count = 0  # cumulative real tokens (CPU)
++        self._total_compute_token_count = 0  # cumulative compute tokens (CPU)
++        self._token_track_time = time.monotonic()  # wall time at last log
++        self._train_start_time = time.monotonic()
++
+         if gen_kwargs is not None:
+             # https://github.com/huggingface/transformers/blob/v4.45.0/src/transformers/trainer_seq2seq.py#L287
+             self._gen_kwargs = gen_kwargs
+@@ -140,6 +278,99 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
+         create_custom_scheduler(self.args, num_training_steps, optimizer)
+         return super().create_scheduler(num_training_steps, optimizer)
+ 
++    @override
++    def log(self, logs: dict[str, float], start_time: Optional[float] = None) -> None:
++        now = time.monotonic()
++        elapsed = now - self._token_track_time
++        world_size = self.args.world_size
++        # Sync GPU token counts to CPU only at log time (avoids per-step GPU sync)
++        if self._token_count_gpu is not None:
++            token_count = int(self._token_count_gpu.item())
++            self._total_token_count += token_count
++            self._token_count_gpu = None
++        else:
++            token_count = 0
++        real_token_count = 0
++        if self._real_token_count_gpu is not None:
++            real_token_count = int(self._real_token_count_gpu.item())
++            compute_token_count = int(self._compute_token_count_gpu.item())
++            self._total_real_token_count += real_token_count
++            self._total_compute_token_count += compute_token_count
++            self._real_token_count_gpu = None
++            self._compute_token_count_gpu = None
++        if elapsed > 0 and (token_count > 0 or real_token_count > 0):
++            total_elapsed = now - self._train_start_time
++            if token_count > 0:
++                logs["train/tokens_per_second"] = token_count * world_size / elapsed
++                logs["train/total_tokens"] = self._total_token_count * world_size
++                logs["train/tokens_per_second_avg"] = self._total_token_count * world_size / total_elapsed
++            if real_token_count > 0:
++                logs["train/total_real_tokens"] = self._total_real_token_count * world_size
++                logs["train/total_compute_tokens"] = self._total_compute_token_count * world_size
++                logs["train/real_tok_per_second"] = real_token_count * world_size / elapsed
++                logs["train/compute_tok_per_second"] = compute_token_count * world_size / elapsed
++        # Log unscaled loss running average for loss_scaling experiments
++        if self._odb_unscaled_loss_count > 0:
++            logs["train/unscaled_loss"] = self._odb_unscaled_loss_sum / self._odb_unscaled_loss_count
++            self._odb_unscaled_loss_sum = 0.0
++            self._odb_unscaled_loss_count = 0
++        self._token_track_time = now
++        super().log(logs, start_time=start_time)
++
++    def _rebuild_lazy_dataloader_without_shuffle(self, old_dataloader):
++        """Rebuild lazy dataloader with shuffle=False while preserving OLG/ODB features."""
++        from torch.utils.data import DataLoader, DistributedSampler, SequentialSampler
++
++        # Check if the dataloader has OLG/ODB attributes
++        has_olg = hasattr(old_dataloader, '_olg_enabled')
++        has_odb = hasattr(old_dataloader, '_odb_enabled')
++
++        # Determine sampler based on whether we're in distributed mode
++        if isinstance(old_dataloader.sampler, DistributedSampler):
++            # In distributed mode, create a new DistributedSampler with shuffle=False
++            sampler = DistributedSampler(
++                old_dataloader.dataset,
++                num_replicas=old_dataloader.sampler.num_replicas,
++                rank=old_dataloader.sampler.rank,
++                shuffle=False,
++            )
++        else:
++            # In single-process mode, use SequentialSampler
++            sampler = SequentialSampler(old_dataloader.dataset)
++
++        # Create new dataloader with the appropriate sampler
++        new_dataloader = DataLoader(
++            old_dataloader.dataset,
++            batch_size=1 if has_odb else old_dataloader.batch_size,
++            sampler=sampler,
++            num_workers=old_dataloader.num_workers,
++            collate_fn=old_dataloader.collate_fn,
++            pin_memory=old_dataloader.pin_memory,
++            drop_last=old_dataloader.drop_last,
++            prefetch_factor=getattr(old_dataloader, 'prefetch_factor', 2) if old_dataloader.num_workers > 0 else None,
++        )
++
++        # Re-apply OLG/ODB if they were enabled
++        if has_olg:
++            from ...data.dataloaders import apply_online_length_grouped
++            apply_online_length_grouped(new_dataloader)
++        elif has_odb:
++            from ...data.dataloaders import apply_odb
++            max_input_length = getattr(old_dataloader, '_odb_max_input_length', 8192)
++            apply_odb(
++                new_dataloader,
++                max_input_length,
++                version=self._odb_version,
++                join_mode=self._odb_join_mode,
++                loss_scaling_mode=self._odb_loss_scaling_mode,
++                no_warmup=self._odb_no_warmup,
++                no_sync=self._odb_no_sync,
++                buffer_size=self._odb_buffer_size,
++                max_patches=self._odb_max_patches,
++            )
++
++        return new_dataloader
++
+     @override
+     def _get_train_sampler(self, *args, **kwargs) -> Optional["torch.utils.data.Sampler"]:
+         if self.finetuning_args.disable_shuffling:
+@@ -147,8 +378,261 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
+ 
+         return super()._get_train_sampler(*args, **kwargs)
+ 
++    def get_train_dataloader(self):
++        """Override to use lazy dataloader or apply ODB when configured."""
++        if self._lazy_dataloader is not None:
++            # Use the pre-configured lazy dataloader (for OLG/ODB with QMDB)
++            logger.info_rank0(
++                f"Using lazy dataloader, len={len(self._lazy_dataloader)}, "
++                f"sampler: {type(self._lazy_dataloader.sampler).__name__}"
++            )
++            dataloader = self._lazy_dataloader
++        else:
++            # Get the standard dataloader from parent
++            dataloader = super().get_train_dataloader()
++
++            # Apply ODB to standard HuggingFace Dataset if enabled
++            if self._use_odb:
++                if dataloader.batch_size != 1:
++                    logger.info_rank0(
++                        f"[ODB] DataLoader batch_size overridden: {dataloader.batch_size} -> 1"
++                    )
++                    from torch.utils.data import DataLoader as TorchDataLoader
++
++                    dataloader = TorchDataLoader(
++                        dataloader.dataset,
++                        batch_size=1,
++                        sampler=dataloader.sampler,
++                        num_workers=dataloader.num_workers,
++                        collate_fn=dataloader.collate_fn,
++                        pin_memory=dataloader.pin_memory,
++                        drop_last=False,
++                        prefetch_factor=getattr(dataloader, "prefetch_factor", 2)
++                        if dataloader.num_workers > 0
++                        else None,
++                    )
++
++                from ...data.dataloaders import apply_odb
++
++                apply_odb(
++                    dataloader,
++                    self._odb_max_input_length,
++                    version=self._odb_version,
++                    join_mode=self._odb_join_mode,
++                    loss_scaling_mode=self._odb_loss_scaling_mode,
++                    no_warmup=self._odb_no_warmup,
++                    no_sync=self._odb_no_sync,
++                    buffer_size=self._odb_buffer_size,
++                    max_patches=self._odb_max_patches,
++                )
++
++        # Register ODB epoch tracking callback
++        if self._use_odb and not self._odb_epoch_callback_registered:
++            self._setup_odb_epoch_tracking(dataloader)
++
++        # Wrap with profiling if enabled
++        if os.environ.get("PROFILE_DATALOADER"):
++            num_params = sum(p.numel() for p in self.model.parameters())
++            dataloader = _wrap_dataloader_profiling(
++                dataloader, use_odb=self._use_odb,
++                output_dir=self.args.output_dir, num_params=num_params,
++            )
++
++        return dataloader
++
++    def get_eval_dataloader(self, eval_dataset=None):
++        """Override to use SimpleCollator for eval when using lazy TMDB datasets."""
++        if self._lazy_dataloader is not None:
++            # Lazy TMDB datasets return [1, seq_len] tensors — need SimpleCollator, not
++            # the standard MultiModalDataCollatorForSeq2Seq which expects list[int] input_ids.
++            from torch.utils.data import DataLoader, DistributedSampler, SequentialSampler
++
++            eval_ds = eval_dataset if eval_dataset is not None else self.eval_dataset
++            if eval_ds is None:
++                return super().get_eval_dataloader(eval_dataset)
++
++            # Use SimpleCollator for proper handling of lazy dataset output format
++            from ...data.lazy.collator import create_simple_collator
++
++            compute_dtype = None
++            if getattr(self.args, "bf16", False):
++                compute_dtype = torch.bfloat16
++            elif getattr(self.args, "fp16", False):
++                compute_dtype = torch.float16
++
++            eval_collator = create_simple_collator(
++                self.processing_class,
++                compute_dtype=compute_dtype,
++            )
++
++            if self.args.world_size > 1:
++                sampler = DistributedSampler(
++                    eval_ds,
++                    num_replicas=self.args.world_size,
++                    rank=self.args.process_index,
++                    shuffle=False,
++                )
++            else:
++                sampler = SequentialSampler(eval_ds)
++
++            return DataLoader(
++                eval_ds,
++                batch_size=self.args.per_device_eval_batch_size,
++                sampler=sampler,
++                collate_fn=eval_collator,
++                num_workers=self.args.dataloader_num_workers,
++                pin_memory=self.args.dataloader_pin_memory,
++                drop_last=False,
++                prefetch_factor=getattr(self.args, "dataloader_prefetch_factor", 2)
++                if self.args.dataloader_num_workers > 0
++                else None,
++            )
++
++        return super().get_eval_dataloader(eval_dataset)
++
++    def _setup_odb_epoch_tracking(self, dataloader):
++        """Set up correct epoch tracking for ODB dynamic batching.
++
++        Aligned with QQMM's approach:
++        1. max_steps = total samples (not optimizer steps)
++        2. Disable __len__ to prevent Trainer from overriding max_steps
++        3. Callback tracks actual samples, overrides epoch, compensates lr_scheduler
++        """
++        # Calculate total samples target — use dataset size directly (not dataloader len
++        # which divides by batch_size and world_size, leading to incorrect totals when bs>1)
++        dataset_size = len(dataloader.dataset)
++        odb_total_samples = int(dataset_size * self.args.num_train_epochs)
++        logger.info_rank0(
++            f"[ODB] Total samples target={odb_total_samples} "
++            f"(dataset_size={dataset_size} × epochs={self.args.num_train_epochs})"
++        )
++
++        active_max_steps = getattr(self.args, "max_steps", None)
++        try:
++            max_optimizer_steps = int(active_max_steps) if active_max_steps is not None else None
++        except (TypeError, ValueError):
++            max_optimizer_steps = None
++        if max_optimizer_steps is not None and max_optimizer_steps <= 0:
++            max_optimizer_steps = None
++
++        # Set max_steps to total samples count.
++        # HuggingFace Trainer uses max_steps for lr_scheduler total steps.
++        # The callback compensates lr_scheduler stepping by calling extra
++        # lr_scheduler.step() calls proportional to batch size each optimizer step.
++        self.args.max_steps = odb_total_samples
++
++        # Disable __len__ to prevent Trainer from recalculating max_steps
++        type(dataloader).__len__ = lambda self: None
++
++        # Register the callback. For short validation runs, preserve the
++        # original optimizer-step cap while keeping the sample-budget scheduler
++        # semantics used by full ODB training.
++        try:
++            self.add_callback(ODBDynamicBatchCallback(odb_total_samples, max_optimizer_steps=max_optimizer_steps))
++        except TypeError:
++            self.add_callback(ODBDynamicBatchCallback(odb_total_samples))
++        self._odb_epoch_callback_registered = True
++
++        # Replace ProgressCallback so the progress bar shows sample progress
++        # (total_data_step / max_steps) instead of step progress (global_step / max_steps)
++        from transformers.trainer_callback import ProgressCallback
++
++        self.remove_callback(ProgressCallback)
++        self.add_callback(_ODBProgressCallback())
++
++    @override
++    def set_initial_training_values(self, args, dataloader, total_train_batch_size):
++        result = super().set_initial_training_values(args, dataloader, total_train_batch_size)
++        if self._use_odb and self._odb_epoch_callback_registered:
++            import math
++            num_train_epochs = math.ceil(args.num_train_epochs)
++            logger.info_rank0(
++                f"[ODB] Overriding num_train_epochs: {result[0]} → {num_train_epochs}"
++            )
++            result = (num_train_epochs,) + result[1:]
++        return result
++
+     @override
+     def compute_loss(self, model, inputs, *args, **kwargs):
++        # Stat mode: skip forward/backward, just drain the dataloader
++        if os.environ.get("ODB_STAT_LENGTH_FILE"):
++            inputs.pop("total_batch_size", None)
++            inputs.pop("local_batch_size", None)
++            inputs.pop("odb_local_tokens", None)
++            inputs.pop("odb_total_tokens", None)
++            return torch.tensor(0.0, device=inputs["input_ids"].device, requires_grad=True)
++
++        # ODB: extract metadata for epoch tracking and loss scaling
++        if self._use_odb:
++            input_ids = inputs.get("input_ids")
++            self._odb_local_bs = input_ids.shape[0] if input_ids is not None else 1
++
++            # total_batch_size is always injected by ODB grouping (used by both the
++            # epoch-tracking callback and sample-mode loss scaling).
++            tbs = inputs.pop("total_batch_size", None)
++            inputs.pop("local_batch_size", None)
++            # token-level metadata is only present in token_approx / token_exact modes.
++            _lt = inputs.pop("odb_local_tokens", None)
++            _tt = inputs.pop("odb_total_tokens", None)
++            if _lt is not None:
++                self._odb_local_tokens = int(_lt[0]) if isinstance(_lt, (list, torch.Tensor)) else int(_lt)
++            else:
++                self._odb_local_tokens = None
++            if _tt is not None:
++                self._odb_total_tokens = int(_tt[0]) if isinstance(_tt, (list, torch.Tensor)) else int(_tt)
++            else:
++                self._odb_total_tokens = None
++            if tbs is not None:
++                if isinstance(tbs, torch.Tensor):
++                    val = int(tbs.item()) if tbs.numel() == 1 else int(tbs[0].item())
++                else:
++                    val = int(tbs)
++                self._odb_total_bs = val
++                if hasattr(self.state, "total_batch_sizes"):
++                    self.state.total_batch_sizes.append(val)
++            else:
++                self._odb_total_bs = None
++
++        # Track useful tokens on GPU (no sync per step)
++        labels = inputs.get("labels")
++        if labels is not None:
++            useful_tokens = (labels != IGNORE_INDEX).sum()
++            if self._token_count_gpu is None:
++                self._token_count_gpu = useful_tokens.clone()
++            else:
++                self._token_count_gpu += useful_tokens
++
++        # Track real tokens (non-padding) and compute tokens (total tensor elements)
++        input_ids = inputs.get("input_ids")
++        if input_ids is not None:
++            pad_id = getattr(self.processing_class, "pad_token_id", 0) or 0
++            real_tokens = (input_ids != pad_id).sum()
++            compute_tokens = torch.tensor(input_ids.numel(), device=input_ids.device)
++            if self._real_token_count_gpu is None:
++                self._real_token_count_gpu = real_tokens.clone()
++                self._compute_token_count_gpu = compute_tokens.clone()
++            else:
++                self._real_token_count_gpu += real_tokens
++                self._compute_token_count_gpu += compute_tokens
++
++        # Reset rope_deltas cache before each forward pass
++        # This is necessary for ODB dynamic batching where batch sizes vary
++        # and cached rope_deltas from previous batch may have incompatible shape
++        base_model = model
++        # Handle DDP wrapper: DistributedDataParallel -> module
++        if hasattr(model, "module"):  # DDP wrapper
++            base_model = model.module
++        if hasattr(base_model, "base_model"):  # PeftModel
++            base_model = base_model.base_model
++        if hasattr(base_model, "model"):  # LoraModel
++            base_model = base_model.model
++        if hasattr(base_model, "model") and hasattr(base_model.model, "rope_deltas"):  # Qwen3VL
++            base_model.model.rope_deltas = None
++
++        # Log ODB batch metadata if explicitly enabled.
++        # if self._use_odb and self.state.global_step % self.args.logging_steps == 0:
++        #     self._log_odb_batch_info(inputs)
++
+         if self.finetuning_args.use_asft_loss:
+             with torch.no_grad():
+                 ref_outputs = self.ref_model(
+@@ -157,9 +641,93 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
+                 )
+                 ref_logits = ref_outputs.logits
+             outputs = model(**inputs)
+-            return self.compute_loss_func(outputs, inputs["labels"], ref_logits)
++            loss = self.compute_loss_func(outputs, inputs["labels"], ref_logits)
++        else:
++            loss = super().compute_loss(model, inputs, *args, **kwargs)
++
++        # ODB DDP loss scaling.
++        #
++        # Each rank's local loss is a per-sample mean: ``L_r = (1/n_r) Σ ℓ_i``
++        # where ``n_r`` is the number of (samples | tokens) on rank r depending on the mode.
++        # PyTorch DDP averages gradients across ranks, giving ``(1/W) Σ_r ∇L_r``.
++        # To recover the desired global mean, we scale the loss on each rank by
++        # ``(n_r / N_total) * W`` so that the post-DDP gradient becomes
++        # ``Σ_r (n_r / N_total) ∇L_r`` -- a correctly weighted average.
++        #
++        # The previous "sample-level" implementation used a custom DDP comm hook
++        # whose denominator (``local_bs * world_size``) was rank-specific, which
++        # left parameters out of sync when ``local_bs`` varied across ranks.  The
++        # comm hook has been removed; all three modes are now applied at the
++        # loss tensor before backward, which is mathematically correct and works
++        # with both DDP and DeepSpeed.
++        if self._use_odb:
++            import torch.distributed as _dist
++
++            world_size = _dist.get_world_size() if _dist.is_initialized() else 1
++            if world_size > 1:
++                mode = self._odb_loss_scaling_mode
++                if mode == "sample":
++                    if self._odb_total_bs is not None and self._odb_total_bs > 0:
++                        self._odb_unscaled_loss_sum += loss.detach().item()
++                        self._odb_unscaled_loss_count += 1
++                        loss = loss * (float(self._odb_local_bs) / float(self._odb_total_bs)) * world_size
++                elif mode in ("token_approx", "token_exact"):
++                    if (
++                        self._odb_local_tokens is not None
++                        and self._odb_total_tokens is not None
++                        and self._odb_total_tokens > 0
++                    ):
++                        self._odb_unscaled_loss_sum += loss.detach().item()
++                        self._odb_unscaled_loss_count += 1
++                        loss = loss * (float(self._odb_local_tokens) / float(self._odb_total_tokens)) * world_size
++
++        return loss
++
++    def _log_odb_batch_info(self, inputs: dict) -> None:
++        """Log detailed ODB batch information for diagnostics."""
++        import psutil
++
++        # Get ODB metadata from batch
++        batch_size = inputs.pop("_odb_batch_size", None)
++        samples_with_image = inputs.pop("_odb_samples_with_image", None)
++        max_input_len = inputs.pop("_odb_max_input_len", None)
++        total_tokens = inputs.pop("_odb_total_tokens", None)
++        total_batch_size = inputs.get("total_batch_size")
++
++        # Get pixel_values info
++        pixel_values = inputs.get("pixel_values")
++        if pixel_values is not None:
++            pv_shape = tuple(pixel_values.shape)
++            pv_mb = pixel_values.numel() * pixel_values.element_size() / 1024 / 1024
++        else:
++            pv_shape = None
++            pv_mb = 0
++
++        # Get memory info
++        gpu_mem_gb = torch.cuda.memory_allocated() / 1024 / 1024 / 1024 if torch.cuda.is_available() else 0
++        gpu_mem_reserved_gb = torch.cuda.memory_reserved() / 1024 / 1024 / 1024 if torch.cuda.is_available() else 0
++        cpu_mem_gb = psutil.Process().memory_info().rss / 1024 / 1024 / 1024
++
++        # Get input_ids info
++        input_ids = inputs.get("input_ids")
++        if input_ids is not None:
++            ids_shape = tuple(input_ids.shape)
++            actual_seq_len = input_ids.size(-1) if input_ids.dim() >= 1 else 0
+         else:
+-            return super().compute_loss(model, inputs, *args, **kwargs)
++            ids_shape = None
++            actual_seq_len = 0
++
++        # Log the info
++        logger.info_rank0(
++            f"[ODB Step {self.state.global_step}] "
++            f"batch_size={batch_size}, total_batch_size={total_batch_size}, "
++            f"samples_with_image={samples_with_image}\n"
++            f"    input_ids: shape={ids_shape}, seq_len={actual_seq_len}, "
++            f"odb_max_len={max_input_len}, odb_total_tokens={total_tokens}\n"
++            f"    pixel_values: shape={pv_shape}, size={pv_mb:.2f}MB\n"
++            f"    GPU mem: {gpu_mem_gb:.2f}GB allocated, {gpu_mem_reserved_gb:.2f}GB reserved | "
++            f"CPU mem: {cpu_mem_gb:.2f}GB"
++        )
+ 
+     @override
+     def prediction_step(
+@@ -215,16 +783,108 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
+             if len(pad_len):  # move pad token to last
+                 preds[i] = np.concatenate((preds[i][pad_len[0] :], preds[i][: pad_len[0]]), axis=-1)
+ 
+-        input_ids_column = dataset["input_ids"]
+-        try:
+-            input_ids_list = input_ids_column.to_pylist()
+-        except AttributeError:
+-            input_ids_list = list(input_ids_column)
+-
+-        decoded_inputs = self.processing_class.batch_decode(input_ids_list, skip_special_tokens=False)
++        decoded_inputs = self.processing_class.batch_decode(dataset["input_ids"], skip_special_tokens=False)
+         decoded_preds = self.processing_class.batch_decode(preds, skip_special_tokens=skip_special_tokens)
+         decoded_labels = self.processing_class.batch_decode(labels, skip_special_tokens=skip_special_tokens)
+ 
+         with open(output_prediction_file, "w", encoding="utf-8") as f:
+             for text, pred, label in zip(decoded_inputs, decoded_preds, decoded_labels):
+                 f.write(json.dumps({"prompt": text, "predict": pred, "label": label}, ensure_ascii=False) + "\n")
++
++
++class _ProfilingDataLoaderWrapper:
++    """Wraps a DataLoader to measure per-batch fetch time and collate time."""
++
++    def __init__(self, dataloader, use_odb=False, output_dir=None, num_params=None):
++        self._dataloader = dataloader
++        self._use_odb = use_odb
++        self._output_dir = output_dir
++        self._num_params = num_params
++        # Forward all attributes to the underlying dataloader
++        self.dataset = dataloader.dataset
++
++    def __getattr__(self, name):
++        return getattr(self._dataloader, name)
++
++    def __len__(self):
++        return len(self._dataloader)
++
++    def __iter__(self):
++        import sys
++        import time
++        import torch.distributed as dist
++
++        rank = dist.get_rank() if dist.is_initialized() else 0
++        mode = "ODB" if self._use_odb else "Standard"
++
++        total_dl_wait = 0.0
++        total_compute = 0.0
++        batch_count = 0
++        start_time = time.monotonic()
++
++        try:
++            for batch in self._dataloader:
++                t_batch_ready = time.monotonic()
++                if batch_count > 0:
++                    # dl_wait = time from generator resume (trainer done) to next batch ready
++                    total_dl_wait += t_batch_ready - _t_after_yield
++                    # compute = time from yield to generator resume (trainer forward/backward/step)
++                    total_compute += _t_after_yield - _t_before_yield
++                batch_count += 1
++
++                # Periodic logging
++                if batch_count % 10 == 0:
++                    elapsed = time.monotonic() - start_time
++                    n = max(batch_count - 1, 1)
++                    sys.stderr.write(
++                        f"[DL-PROF {mode} rank{rank}] batch={batch_count} "
++                        f"elapsed={elapsed:.1f}s "
++                        f"dl_wait={total_dl_wait:.2f}s({total_dl_wait / elapsed * 100:.1f}%) "
++                        f"compute={total_compute:.2f}s({total_compute / elapsed * 100:.1f}%) "
++                        f"avg_dl_wait={total_dl_wait / n * 1000:.0f}ms "
++                        f"avg_compute={total_compute / n * 1000:.0f}ms\n"
++                    )
++                    sys.stderr.flush()
++
++                _t_before_yield = time.monotonic()
++                yield batch
++                _t_after_yield = time.monotonic()
++        finally:
++            elapsed = time.monotonic() - start_time
++            other_s = elapsed - total_dl_wait - total_compute
++            n = max(batch_count - 1, 1)
++            sys.stderr.write(
++                f"[DL-PROF-FINAL {mode} rank{rank}] batches={batch_count} "
++                f"elapsed={elapsed:.1f}s "
++                f"dl_wait={total_dl_wait:.2f}s({total_dl_wait / max(elapsed, 0.001) * 100:.1f}%) "
++                f"compute={total_compute:.2f}s({total_compute / max(elapsed, 0.001) * 100:.1f}%) "
++                f"other={other_s:.2f}s({other_s / max(elapsed, 0.001) * 100:.1f}%) "
++                f"avg_dl_wait={total_dl_wait / n * 1000:.0f}ms "
++                f"avg_compute={total_compute / n * 1000:.0f}ms\n"
++            )
++            sys.stderr.flush()
++            if rank == 0 and self._output_dir:
++                import json
++                import os
++                prof_data = {
++                    "mode": mode,
++                    "batches": batch_count,
++                    "elapsed_s": round(elapsed, 2),
++                    "total_dl_wait_s": round(total_dl_wait, 2),
++                    "total_compute_s": round(total_compute, 2),
++                    "other_s": round(other_s, 2),
++                    "pipeline_overlap": round(total_compute / max(total_dl_wait + total_compute, 0.001), 4),
++                    "num_params": self._num_params,
++                }
++                path = os.path.join(self._output_dir, "dl_prof.json")
++                try:
++                    with open(path, "w") as f:
++                        json.dump(prof_data, f, indent=2)
++                except OSError:
++                    pass
++
++
++def _wrap_dataloader_profiling(dataloader, use_odb=False, output_dir=None, num_params=None):
++    """Wrap a DataLoader with profiling instrumentation."""
++    logger.info_rank0("[PROFILE_DATALOADER] Wrapping dataloader with profiling")
++    return _ProfilingDataLoaderWrapper(dataloader, use_odb=use_odb, output_dir=output_dir, num_params=num_params)
+diff --git a/src/llamafactory/train/sft/workflow.py b/src/llamafactory/train/sft/workflow.py
+index b50f53ff..b291df79 100644
+--- a/src/llamafactory/train/sft/workflow.py
++++ b/src/llamafactory/train/sft/workflow.py
+@@ -38,6 +38,14 @@ if TYPE_CHECKING:
+ logger = get_logger(__name__)
+ 
+ 
++def _odb_package_loss_scaling(mode: str) -> str:
++    if mode == "token_exact":
++        return "exact"
++    if mode == "token_approx":
++        return "approx"
++    return "none"
++
++
+ def run_sft(
+     model_args: "ModelArguments",
+     data_args: "DataArguments",
+@@ -65,7 +73,6 @@ def run_sft(
+         pad_to_multiple_of=8 if training_args.do_train else None,  # for shift short attention
+         label_pad_token_id=IGNORE_INDEX if data_args.ignore_pad_token_for_loss else tokenizer.pad_token_id,
+         block_diag_attn=model_args.block_diag_attn,
+-        neat_packing=data_args.neat_packing,
+         attn_implementation=getattr(model.config, "_attn_implementation", None),
+         compute_dtype=model_args.compute_dtype,
+         **tokenizer_module,
+@@ -103,18 +110,64 @@ def run_sft(
+     gen_kwargs["pad_token_id"] = tokenizer.pad_token_id
+ 
+     # Initialize our Trainer
+-    trainer = CustomSeq2SeqTrainer(
+-        model=model,
+-        args=training_args,
+-        finetuning_args=finetuning_args,
+-        data_collator=data_collator,
+-        callbacks=callbacks,
+-        gen_kwargs=gen_kwargs,
+-        ref_model=ref_model,
+-        **dataset_module,
+-        **tokenizer_module,
+-        **metric_module,
+-    )
++    if model_args.use_kt:
++        from ktransformers.sft.lora import KTrainer  # type: ignore
++        from ktransformers.util.globals import GLOBAL_CONFIG  # type: ignore
++
++        GLOBAL_CONFIG._config["mod"] = "sft"
++
++        trainer = KTrainer(
++            model=model,
++            args=training_args,
++            tokenizer=tokenizer_module,
++            data_collator=data_collator,
++            callbacks=callbacks,
++            **dataset_module,
++            **metric_module,
++        )
++        trainer.model_accepts_loss_kwargs = False
++        model.config.use_cache = False
++
++    else:
++        trainer = CustomSeq2SeqTrainer(
++            model=model,
++            args=training_args,
++            finetuning_args=finetuning_args,
++            data_collator=data_collator,
++            callbacks=callbacks,
++            gen_kwargs=gen_kwargs,
++            ref_model=ref_model,
++            **dataset_module,
++            **tokenizer_module,
++            **metric_module,
++        )
++
++    if dataset_module.get("_enable_odb_with_package"):
++        from odb.integrations.llamafactory import enable_odb
++
++        loss_scaling = _odb_package_loss_scaling(data_args.odb_loss_scaling_mode)
++        logger.info_rank0(
++            "[ODB] Enabling standalone package via "
++            "odb.integrations.llamafactory.enable_odb("
++            f"token_budget={data_args.odb_max_input_length}, "
++            f"loss_scaling={loss_scaling}, join={data_args.odb_join_mode})"
++        )
++        enable_odb(
++            trainer,
++            train_dataloader=dataset_module["_lazy_dataloader"],
++            training_args=training_args,
++            data_args=data_args,
++            train_dataset=dataset_module["train_dataset"],
++            token_budget=data_args.odb_max_input_length,
++            loss_scaling=loss_scaling,
++            join=data_args.odb_join_mode,
++            trainer_integration="framework",
++            no_warmup=data_args.odb_no_warmup,
++            no_sync=data_args.odb_no_sync,
++            buffer_size=data_args.odb_buffer_size,
++            max_patches=data_args.odb_max_patches,
++            version=data_args.odb_version,
++        )
+ 
+     # Training
+     if training_args.do_train:
