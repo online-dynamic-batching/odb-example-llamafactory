@@ -175,6 +175,9 @@ needed by this example.
 This example keeps model-specific preprocessing inside LLaMA-Factory. ODB is
 enabled after LLaMA-Factory has produced single-sample tensor dictionaries.
 
+For the package API contract behind this hook, see the
+[LLaMA-Factory integration guide](https://github.com/online-dynamic-batching/online-dynamic-batching/blob/main/docs/integration-guides/llamafactory.md).
+
 ## Related Examples
 
 - Shared public data recipe: [odb-mm-mix-example](https://github.com/online-dynamic-batching/odb-mm-mix-example)
