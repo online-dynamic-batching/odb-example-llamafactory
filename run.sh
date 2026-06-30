@@ -82,7 +82,8 @@ cmd_data() {
   "$PYTHON" -m pip install -e "$DATA_REPO_DIR"
   "$PYTHON" "$DATA_REPO_DIR/scripts/build_public_mm_mix.py" \
     --output "$DATA_DIR" \
-    --overwrite
+    --overwrite \
+    "$@"
 }
 
 cmd_prepare() {
