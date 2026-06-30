@@ -180,7 +180,7 @@ For the package API contract behind this hook, see the
 
 ## Related Examples
 
-- Shared public data recipe: [odb-mm-mix-example](https://github.com/online-dynamic-batching/odb-mm-mix-example)
+- Shared dataset builder: [build-mm-mix-dataset](https://github.com/online-dynamic-batching/build-mm-mix-dataset)
 - HF Trainer native example: [odb-example-hf-trainer](https://github.com/online-dynamic-batching/odb-example-hf-trainer)
 - Accelerate example: [odb-example-accelerate](https://github.com/online-dynamic-batching/odb-example-accelerate)
 - Lightning example: [odb-example-lightning](https://github.com/online-dynamic-batching/odb-example-lightning)

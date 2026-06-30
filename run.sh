@@ -4,7 +4,7 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PYTHON="${PYTHON:-python}"
 
-DATA_REPO_DIR="${ODB_MM_MIX_DATA_REPO:-$ROOT_DIR/.deps/odb-mm-mix-example}"
+DATA_REPO_DIR="${ODB_MM_MIX_DATA_REPO:-$ROOT_DIR/.deps/build-mm-mix-dataset}"
 LLAMAFACTORY_ROOT="${LLAMAFACTORY_ROOT:-$ROOT_DIR/.deps/LLaMA-Factory-odb}"
 DATA_DIR="${ODB_MM_MIX_DATA_DIR:-$ROOT_DIR/data/mm-mix-tmdb}"
 RUN_DIR="${ODB_LF_RUN_DIR:-$ROOT_DIR/data/llamafactory-mm-mix}"
@@ -77,7 +77,7 @@ cmd_setup_lf() {
 cmd_data() {
   mkdir -p "$(dirname "$DATA_REPO_DIR")" "$(dirname "$DATA_DIR")"
   if [[ ! -d "$DATA_REPO_DIR/.git" ]]; then
-    git clone https://github.com/online-dynamic-batching/odb-mm-mix-example.git "$DATA_REPO_DIR"
+    git clone https://github.com/online-dynamic-batching/build-mm-mix-dataset.git "$DATA_REPO_DIR"
   fi
   "$PYTHON" -m pip install -e "$DATA_REPO_DIR"
   "$PYTHON" "$DATA_REPO_DIR/scripts/build_public_mm_mix.py" \
